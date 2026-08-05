@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --homigo-primary: #0f172a;
+  --homigo-secondary: #1e3a8a;
+  --homigo-accent: #22c55e;
+  --homigo-bg: #f8fafc;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-homigo-primary: var(--homigo-primary);
+  --color-homigo-secondary: var(--homigo-secondary);
+  --color-homigo-accent: var(--homigo-accent);
+  --color-homigo-bg: var(--homigo-bg);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  overflow-x: hidden;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  overflow-x: hidden;
+  background: var(--homigo-bg);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+@layer utilities {
+  .touch-target {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+  }
+}
