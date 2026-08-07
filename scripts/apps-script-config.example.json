@@ -1,0 +1,5 @@
+{
+  "HOMIGO_API_URL": "https://YOUR_PUBLIC_DOMAIN.vercel.app/api/workers/import",
+  "HOMIGO_IMPORT_SECRET": "paste-same-value-as-WORKERS_IMPORT_SECRET",
+  "_note": "HOMIGO_API_URL must NOT be localhost. Google Apps Script cannot reach your local machine."
+}
