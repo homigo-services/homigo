@@ -10,7 +10,14 @@
     "format": "biome format --write",
     "setup:workers": "node scripts/setup-workers-env.mjs",
     "verify:workers": "node scripts/verify-workers-setup.mjs",
-    "test:workers": "node scripts/test-workers-api.mjs"
+    "test:workers": "node scripts/test-workers-api.mjs",
+    "test:whatsapp": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-whatsapp-webhook.mjs",
+    "test:whatsapp:booking": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-whatsapp-booking-flow.mjs",
+    "test:worker:matching": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-worker-matching.mjs",
+    "seed:panvel:plumbers": "cross-env NODE_OPTIONS=--use-system-ca node scripts/seed-panvel-plumber-workers.mjs",
+    "test:booking:confirmation": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-booking-confirmation.mjs",
+    "test:service:completion:payment": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-service-completion-payment-flow.mjs",
+    "test:cash:completion": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-cash-payment-completion.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.0",

@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 type IconName =
   | "dashboard"
   | "bookings"
+  | "requests"
   | "customers"
   | "workers"
   | "payments"
@@ -34,6 +35,13 @@ export function AdminIcon({ name, className = "h-5 w-5" }: IconProps) {
         strokeLinecap="round"
         strokeLinejoin="round"
         d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5"
+      />
+    ),
+    requests: (
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M8.25 9.75h7.5M8.25 12.75h7.5M8.25 15.75h4.5M6 4.5h12A1.5 1.5 0 0119.5 6v12a1.5 1.5 0 01-1.5 1.5H6A1.5 1.5 0 014.5 18V6A1.5 1.5 0 016 4.5z"
       />
     ),
     customers: (
