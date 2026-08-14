@@ -77,6 +77,7 @@ export async function POST(request: Request) {
     });
 
     if (claim.duplicate) {
+      console.log("[whatsapp] duplicate webhook skipped:", message.messageId);
       continue;
     }
 

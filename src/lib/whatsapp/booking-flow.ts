@@ -31,6 +31,7 @@ import {
 } from "./booking-messages";
 import {
   type ConversationContext,
+  readyLanguageContext,
   updateConversation,
 } from "./conversation";
 import { isGreeting } from "./parser";
@@ -715,8 +716,7 @@ export async function sendPostLanguageServiceMenu(
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
     context: {
-      ...(conversation.context as ConversationContext),
-      phase: "ready",
+      ...readyLanguageContext(conversation.context as ConversationContext, lang),
       service_menu: menuResult.menu,
     },
   });
@@ -750,8 +750,7 @@ export async function sendReturningCustomerServiceMenu(
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
     context: {
-      ...(conversation.context as ConversationContext),
-      phase: "ready",
+      ...readyLanguageContext(conversation.context as ConversationContext, lang),
       service_menu: menuResult.menu,
     },
   });

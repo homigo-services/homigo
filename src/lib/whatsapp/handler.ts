@@ -16,12 +16,15 @@ import {
 import {
   type ConversationContext,
   ensureConversation,
+  freshOnboardingContext,
   isConversationReady,
   markConversationReady,
   resetConversationForNewBooking,
+  readyLanguageContext,
   updateConversation,
 } from "./conversation";
 import { upsertCustomerFromWhatsApp } from "./customer";
+import { waDebug } from "./debug-log";
 import {
   COMPLETED_BOOKING_NUDGE,
   INVALID_LANGUAGE_SELECTION,
@@ -33,6 +36,7 @@ import {
 } from "./messages";
 import type { ParsedWhatsAppMessage } from "./parser";
 import { isGreeting, normalizeWhatsAppMobile } from "./parser";
+import { shouldSkipLanguageForReturningCustomer } from "./routing";
 import type { WhatsappConversationState } from "./types";
 
 export interface HandleMessageResult {
@@ -64,9 +68,9 @@ function effectiveLanguage(customer: Customer): "en" | "mr" | "hi" {
   return "mr";
 }
 
-/** Greeting on these states starts fresh onboarding instead of stale status replies. */
+/** Greeting on completed state starts fresh onboarding instead of stale status replies. */
 function shouldRestartOnboardingForGreeting(state: WhatsappConversationState): boolean {
-  return state === "completed" || state === "worker_assignment";
+  return state === "completed";
 }
 
 /** WhatsApp-created customer not yet through profile collection. */
@@ -88,6 +92,13 @@ export async function handleIncomingTextMessage(
 ): Promise<HandleMessageResult> {
   const mobile = normalizeWhatsAppMobile(message.from);
   const text = message.textBody?.trim() ?? "";
+
+  waDebug("IN", {
+    messageId: message.messageId,
+    mobile,
+    actor: "customer",
+    textPreview: text,
+  });
 
   if (!message.messageId || !mobile) {
     return { handled: false, replied: false, error: "Invalid message metadata" };
@@ -124,6 +135,13 @@ export async function handleIncomingTextMessage(
   let conversation = convResult.data;
   let ctx = conversation.context as ConversationContext;
 
+  waDebug("STATE", {
+    messageId: message.messageId,
+    mobile,
+    state: conversation.state,
+    phase: String(ctx.phase ?? ""),
+  });
+
   if (conversation.customer_id !== customer.id) {
     const linked = await updateConversation(supabase, conversation.id, {
       customer_id: customer.id,
@@ -140,16 +158,22 @@ export async function handleIncomingTextMessage(
   ) {
     const reset = await updateConversation(supabase, conversation.id, {
       state: "language_selection",
-      context: {
-        ...ctx,
-        phase: undefined,
+      service_request_id: null,
+      booking_id: null,
+      context: freshOnboardingContext({
         whatsapp_onboarding_started: ctx.whatsapp_onboarding_started ?? false,
-      },
+      }),
     });
     if (reset.data) {
       conversation = reset.data;
       ctx = conversation.context as ConversationContext;
     }
+    waDebug("BRANCH", {
+      messageId: message.messageId,
+      mobile,
+      branch: "heal_incomplete_profile",
+      state: conversation.state,
+    });
   }
 
   const lang = language;
@@ -160,15 +184,24 @@ export async function handleIncomingTextMessage(
       state: "language_selection",
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
-      context: {
-        whatsapp_onboarding_started: true,
-      },
+      context: freshOnboardingContext(),
+    });
+    waDebug("OUT", {
+      messageId,
+      mobile,
+      handler: "sendOnboardingWelcome",
+      replied: send.ok,
     });
     return { handled: true, replied: send.ok };
   }
 
-  // Greeting before booking/worker-assignment handlers — avoids stale worker_assignment reply
+  // Greeting after completed booking — fresh onboarding (never during active matching)
   if (isGreeting(text) && shouldRestartOnboardingForGreeting(conversation.state)) {
+    waDebug("BRANCH", {
+      messageId: message.messageId,
+      mobile,
+      branch: "greeting_reset_completed",
+    });
     const reset = await resetConversationForNewBooking(
       supabase,
       conversation,
@@ -180,6 +213,12 @@ export async function handleIncomingTextMessage(
 
   // worker_assignment — always booking flow (matching retry); never onboarding fallback
   if (conversation.state === "worker_assignment") {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handleBookingFlow",
+      state: conversation.state,
+    });
     return handleBookingFlow({
       supabase,
       customer,
@@ -197,11 +236,22 @@ export async function handleIncomingTextMessage(
       last_message_id: message.messageId,
       last_message_at: new Date().toISOString(),
     });
+    waDebug("OUT", {
+      messageId: message.messageId,
+      mobile,
+      handler: "completed_nudge",
+      replied: send.ok,
+    });
     return { handled: true, replied: send.ok };
   }
 
   // Post-assignment: service completion OTP → payment selection / pending payment
   if (conversation.state === "payment_pending") {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handlePaymentPendingInbound",
+    });
     return handlePaymentPendingInbound(
       supabase,
       conversation,
@@ -212,6 +262,11 @@ export async function handleIncomingTextMessage(
   }
 
   if (conversation.state === "service_completion") {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handleServiceCompletionInbound",
+    });
     return handleServiceCompletionInbound(
       supabase,
       conversation,
@@ -223,6 +278,11 @@ export async function handleIncomingTextMessage(
   }
 
   if (conversation.state === "service_in_progress") {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handleServiceInProgressInbound",
+    });
     return handleServiceInProgressInbound(
       supabase,
       conversation,
@@ -234,6 +294,11 @@ export async function handleIncomingTextMessage(
   }
 
   if (conversation.state === "booking_confirmed") {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handleBookingConfirmedInbound",
+    });
     return handleBookingConfirmedInbound(
       supabase,
       conversation,
@@ -245,6 +310,12 @@ export async function handleIncomingTextMessage(
 
   // Phase 4A booking flow (service selection onward)
   if (isBookingFlowState(conversation.state)) {
+    waDebug("ROUTE", {
+      messageId: message.messageId,
+      mobile,
+      handler: "handleBookingFlow",
+      state: conversation.state,
+    });
     return handleBookingFlow({
       supabase,
       customer,
@@ -255,38 +326,7 @@ export async function handleIncomingTextMessage(
     });
   }
 
-  // Returning customer with completed language onboarding
-  const hasCompletedWhatsappOnboarding = isConversationReady(conversation);
-
-  const isExistingProfileWithLanguage =
-    !customerResult.created &&
-    isValidPreferredLanguage(customer.preferred_language) &&
-    !ctx.whatsapp_onboarding_started &&
-    conversation.state === "language_selection" &&
-    !isIncompleteWhatsAppProfile(customer);
-
-  if (hasCompletedWhatsappOnboarding && conversation.state === "language_selection") {
-    if (isExistingProfileWithLanguage) {
-      const ready = await markConversationReady(
-        supabase,
-        conversation,
-        lang,
-        message.messageId,
-      );
-      if (ready.data) conversation = ready.data;
-    }
-
-    return sendReturningCustomerServiceMenu(
-      supabase,
-      customer,
-      conversation,
-      lang,
-      message.messageId,
-      isGreeting(text),
-    );
-  }
-
-  // WhatsApp onboarding — language selection flow
+  // WhatsApp onboarding — language selection flow (must run before returning-customer shortcut)
   if (conversation.state === "language_selection") {
     if (isGreeting(text)) {
       return sendOnboardingWelcome(message.messageId);
@@ -294,6 +334,11 @@ export async function handleIncomingTextMessage(
 
     const selected = parseLanguageSelection(text);
     if (selected) {
+      waDebug("BRANCH", {
+        messageId: message.messageId,
+        mobile,
+        branch: "language_selected",
+      });
       const langError = await saveCustomerLanguage(
         supabase,
         customer.id,
@@ -323,6 +368,47 @@ export async function handleIncomingTextMessage(
       );
     }
 
+    // Returning customer with completed language onboarding — skip language menu only when safe
+    const isExistingProfileWithLanguage =
+      !customerResult.created &&
+      isValidPreferredLanguage(customer.preferred_language) &&
+      !ctx.whatsapp_onboarding_started &&
+      !isIncompleteWhatsAppProfile(customer);
+
+    if (
+      shouldSkipLanguageForReturningCustomer(
+        conversation,
+        ctx,
+        text,
+        parseLanguageSelection,
+      )
+    ) {
+      waDebug("BRANCH", {
+        messageId: message.messageId,
+        mobile,
+        branch: "returning_customer_skip_language",
+      });
+
+      if (isExistingProfileWithLanguage) {
+        const ready = await markConversationReady(
+          supabase,
+          conversation,
+          lang,
+          message.messageId,
+        );
+        if (ready.data) conversation = ready.data;
+      }
+
+      return sendReturningCustomerServiceMenu(
+        supabase,
+        customer,
+        conversation,
+        lang,
+        message.messageId,
+        isGreeting(text),
+      );
+    }
+
     if (text.length > 0) {
       const send = await sendWhatsAppText(
         mobile,
@@ -332,15 +418,26 @@ export async function handleIncomingTextMessage(
         state: "language_selection",
         last_message_id: message.messageId,
         last_message_at: new Date().toISOString(),
-        context: {
-          ...ctx,
+        context: freshOnboardingContext({
           whatsapp_onboarding_started: true,
-        },
+        }),
+      });
+      waDebug("OUT", {
+        messageId: message.messageId,
+        mobile,
+        handler: "invalid_language",
+        replied: send.ok,
       });
       return { handled: true, replied: send.ok };
     }
   }
 
+  waDebug("BRANCH", {
+    messageId: message.messageId,
+    mobile,
+    branch: "fallback_onboarding",
+    state: conversation.state,
+  });
   return sendOnboardingWelcome(message.messageId);
 }
 

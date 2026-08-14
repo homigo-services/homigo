@@ -381,7 +381,7 @@ async function run() {
     await cleanupTestMobile(mobile);
   }
 
-  // 11. worker_assignment + hi → new onboarding (real WhatsApp stale-state scenario)
+  // 11. worker_assignment + hi → stay in matching (do NOT wipe active booking)
   {
     const mobile = "919999888844";
     await cleanupTestMobile(mobile);
@@ -423,12 +423,66 @@ async function run() {
 
     const conv = await getConversation(mobile);
     log(
-      "worker_assignment + hi → welcome onboarding",
+      "worker_assignment + hi → keep matching state",
       res.ok &&
-        conv?.state === "language_selection" &&
-        conv?.context?.whatsapp_onboarding_started === true &&
-        conv?.state !== "worker_assignment",
+        conv?.state === "worker_assignment" &&
+        conv?.context?.phase === "worker_matching_pending" &&
+        conv?.state !== "language_selection",
       `state=${conv?.state} phase=${conv?.context?.phase ?? "none"}`,
+    );
+
+    await cleanupTestMobile(mobile);
+  }
+
+  // 11c. language_selection + phase=ready + fresh onboarding + '1' → service_selection (language parsed)
+  {
+    const mobile = "919999888855";
+    await cleanupTestMobile(mobile);
+
+    const sb = supabaseClient();
+    const { data: customer } = await sb
+      .from("customers")
+      .insert({
+        name: mobile,
+        mobile,
+        area: "pending",
+        pincode: "pending",
+        address_line: "pending",
+        preferred_language: "mr",
+        is_whatsapp_verified: true,
+        source: "whatsapp",
+        status: "active",
+        subscription_status: "free",
+      })
+      .select("*")
+      .single();
+
+    await sb.from("whatsapp_conversations").insert({
+      whatsapp_mobile: mobile,
+      customer_id: customer.id,
+      preferred_language: "mr",
+      state: "language_selection",
+      context: {
+        phase: "ready",
+        whatsapp_onboarding_started: true,
+      },
+    });
+
+    const { res } = await request("/api/whatsapp/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPayload(`wamid.test.lang1.${Date.now()}`, mobile, "1")),
+    });
+
+    const conv = await getConversation(mobile);
+    const cust = await getCustomer(mobile);
+    log(
+      "language_selection stale phase + onboarding + 1 → language parsed",
+      res.ok &&
+        conv?.state === "service_selection" &&
+        conv?.context?.phase === "ready" &&
+        cust?.preferred_language === "mr",
+      `state=${conv?.state} lang=${cust?.preferred_language}`,
     );
 
     await cleanupTestMobile(mobile);

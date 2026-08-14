@@ -13,6 +13,7 @@
     "test:workers": "node scripts/test-workers-api.mjs",
     "test:whatsapp": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-whatsapp-webhook.mjs",
     "test:whatsapp:booking": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-whatsapp-booking-flow.mjs",
+    "test:whatsapp:routing": "node --experimental-strip-types scripts/test-whatsapp-routing.mjs",
     "test:worker:matching": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-worker-matching.mjs",
     "seed:panvel:plumbers": "cross-env NODE_OPTIONS=--use-system-ca node scripts/seed-panvel-plumber-workers.mjs",
     "test:booking:confirmation": "cross-env NODE_OPTIONS=--use-system-ca node scripts/test-booking-confirmation.mjs",

@@ -201,15 +201,15 @@ export async function handleServiceCompletionInbound(
   });
 
   if (verified.alreadyVerified) {
-    const send = await sendWhatsAppText(customerMobile, alreadyVerifiedOtpMessage(lang));
-    return handlePaymentSelectionInbound(
-      supabase,
-      conversation,
-      customerMobile,
-      lang,
-      messageId,
-      "",
-    ).then((r) => ({ ...r, replied: send.ok || r.replied }));
+    const body = `${alreadyVerifiedOtpMessage(lang)}\n\n${paymentModeMenu(lang)}`;
+    const send = await sendWhatsAppText(customerMobile, body);
+    await updateConversation(supabase, conversation.id, {
+      state: "service_completion",
+      last_message_id: messageId,
+      last_message_at: new Date().toISOString(),
+      context: { ...ctx, phase: "payment_selection" },
+    });
+    return { handled: true, replied: send.ok };
   }
 
   if (!verified.ok) {
