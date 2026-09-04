@@ -52,6 +52,81 @@ export function tomorrowIso(now = new Date()): string {
   return addDaysIso(todayIso(now), 1);
 }
 
+/** DD-MM-YYYY for customer-facing date labels. */
+export function formatIsoAsDdMmYyyy(isoDate: string): string {
+  const [y, m, d] = isoDate.split("-");
+  if (!y || !m || !d) return isoDate;
+  return `${d}-${m}-${y}`;
+}
+
+import { HOMIGO_BOOKING_DATE_WINDOW_DAYS } from "./homigo-services";
+
+/** Latest bookable date (today + window days). */
+export function maxBookingDateIso(now = new Date()): string {
+  return addDaysIso(todayIso(now), HOMIGO_BOOKING_DATE_WINDOW_DAYS);
+}
+
+export function isWithinBookingWindow(isoDate: string, now = new Date()): boolean {
+  if (isPastDate(isoDate, now)) return false;
+  return isoDate <= maxBookingDateIso(now);
+}
+
+export interface BookingDateOption {
+  index: number;
+  iso: string;
+  label: string;
+}
+
+/** Primary date menu: 1 = today, 2 = tomorrow, 3 = custom DD-MM-YYYY. */
+export function bookingDateOptions(now = new Date()): BookingDateOption[] {
+  return [
+    { index: 1, iso: todayIso(now), label: `Today (${formatIsoAsDdMmYyyy(todayIso(now))})` },
+    {
+      index: 2,
+      iso: tomorrowIso(now),
+      label: `Tomorrow (${formatIsoAsDdMmYyyy(tomorrowIso(now))})`,
+    },
+    { index: 3, iso: "", label: "Another date (DD-MM-YYYY)" },
+  ];
+}
+
+/** True when customer chose menu option 3 (custom date entry). */
+export function isCustomDateMenuChoice(text: string): boolean {
+  return text.trim() === "3";
+}
+
+/** Parse date menu selection or DD-MM-YYYY within the booking window. */
+export function parseBookingDateSelection(text: string, now = new Date()): string | null {
+  const trimmed = text.trim();
+
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number.parseInt(trimmed, 10);
+    if (n === 1) {
+      const iso = todayIso(now);
+      return isWithinBookingWindow(iso, now) ? iso : null;
+    }
+    if (n === 2) {
+      const iso = tomorrowIso(now);
+      return isWithinBookingWindow(iso, now) ? iso : null;
+    }
+    return null;
+  }
+
+  let iso: string | null = null;
+  const ymd = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (ymd) {
+    iso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+  } else {
+    const dmy = trimmed.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+    if (dmy) {
+      iso = `${dmy[3]}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
+    }
+  }
+
+  if (!iso || !isWithinBookingWindow(iso, now)) return null;
+  return iso;
+}
+
 export function isPastDate(isoDate: string, now = new Date()): boolean {
   return isoDate < todayIso(now);
 }

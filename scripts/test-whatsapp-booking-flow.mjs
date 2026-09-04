@@ -136,6 +136,14 @@ async function countProcessedEvents(messageId) {
   return count ?? 0;
 }
 
+const HOMIGO_SERVICE_NAMES = [
+  "AC Technician",
+  "Electrician",
+  "Plumber",
+  "Carpenter",
+  "Motor Technician",
+];
+
 async function fetchServices() {
   const sb = supabaseClient();
   if (!sb) return [];
@@ -155,6 +163,11 @@ async function fetchServices() {
     id: s.id,
     name: s.service_name,
   }));
+}
+
+function filterHomigoServices(services) {
+  const byName = new Map(services.map((s) => [s.name.toLowerCase(), s]));
+  return HOMIGO_SERVICE_NAMES.map((name) => byName.get(name.toLowerCase())).filter(Boolean);
 }
 
 async function cleanupTestMobile(mobile) {
@@ -196,10 +209,21 @@ async function selectService(mobile, serviceIndex) {
   return postWebhook(mobile, String(serviceIndex), `wamid.p4a.svc.${mobile}.${Date.now()}`);
 }
 
-async function completeDetails(mobile) {
+async function completeProfileForBooking(mobile) {
+  let conv = await getConversation(mobile);
+  if (conv?.context?.phase === "confirm_saved_address") {
+    await postWebhook(mobile, "1", `wamid.p4a.confirm.${mobile}.${Date.now()}`);
+    return;
+  }
+
   await postWebhook(mobile, "Kothrud", `wamid.p4a.area.${mobile}.${Date.now()}`);
   await postWebhook(mobile, "411038", `wamid.p4a.pin.${mobile}.${Date.now()}`);
   await postWebhook(mobile, "Flat 12, Sample Society", `wamid.p4a.addr.${mobile}.${Date.now()}`);
+}
+
+/** @deprecated use completeProfileForBooking */
+async function completeDetails(mobile) {
+  return completeProfileForBooking(mobile);
 }
 
 async function selectTomorrow(mobile) {
@@ -225,8 +249,9 @@ async function run() {
   }
 
   const services = await fetchServices();
-  if (services.length === 0) {
-    console.error("No services in public.services — seed at least one service to run Phase 4A tests.\n");
+  const homigoServices = filterHomigoServices(services);
+  if (homigoServices.length === 0) {
+    console.error("No Homigo booking services in public.services — run npm run seed:homigo:booking first.\n");
     process.exit(1);
   }
 
@@ -263,18 +288,18 @@ async function run() {
     );
   }
 
-  // C. Dynamic service menu from DB
+  // C. Homigo service menu (5 services max, canonical order)
   {
     await cleanupTestMobile(testMobile);
     const conv = await onboardToServiceSelection(testMobile);
     const menu = conv?.context?.service_menu ?? [];
-    const matchesDb =
-      menu.length === services.length &&
-      menu.every((m, i) => m.id === services[i].id);
+    const matchesHomigo =
+      menu.length === homigoServices.length &&
+      menu.every((m, i) => m.id === homigoServices[i].id && m.name === homigoServices[i].name);
     log(
-      "C. Dynamic service menu from DB",
-      matchesDb,
-      `menu=${menu.length} db=${services.length}`,
+      "C. Homigo service menu (5 services)",
+      matchesHomigo,
+      `menu=${menu.length} homigo=${homigoServices.length}`,
     );
   }
 
@@ -299,8 +324,8 @@ async function run() {
     const conv = await getConversation(testMobile);
     log(
       "E. Valid service selection",
-      conv?.context?.service_id === services[0].id &&
-        conv?.context?.service_name === services[0].name,
+      conv?.context?.service_id === homigoServices[0].id &&
+        conv?.context?.service_name === homigoServices[0].name,
       `service=${conv?.context?.service_name}`,
     );
   }
@@ -382,6 +407,18 @@ async function run() {
   // K. No rate card → graceful response
   {
     await cleanupTestMobile(testMobile);
+    const sb = supabaseClient();
+    const serviceId = homigoServices[0].id;
+    const { data: activeCards } = await sb
+      .from("service_rate_cards")
+      .select("id")
+      .eq("service_id", serviceId)
+      .eq("is_active", true);
+
+    for (const card of activeCards ?? []) {
+      await sb.from("service_rate_cards").update({ is_active: false }).eq("id", card.id);
+    }
+
     await onboardToServiceSelection(testMobile);
     await selectService(testMobile, 1);
     await completeDetails(testMobile);
@@ -397,13 +434,17 @@ async function run() {
         sr.rate_card_accepted === false,
       `state=${conv?.state} sr=${sr?.id ? "yes" : "no"}`,
     );
+
+    for (const card of activeCards ?? []) {
+      await sb.from("service_rate_cards").update({ is_active: true }).eq("id", card.id);
+    }
   }
 
   // L+M+N — seed temp rate card, quote displayed, accept
   {
     const rateMobile = "919999777002";
     await cleanupTestMobile(rateMobile);
-    tempRateCardServiceId = services[0].id;
+    tempRateCardServiceId = homigoServices[0].id;
 
     const sb = supabaseClient();
     const { data: card } = await sb
@@ -472,7 +513,7 @@ async function run() {
     const { data: card } = await sb
       .from("service_rate_cards")
       .insert({
-        service_id: services[0].id,
+        service_id: homigoServices[0].id,
         base_amount: 400,
         lead_charge: 40,
         platform_commission: 80,
@@ -524,7 +565,7 @@ async function run() {
     );
   }
 
-  // Q. Existing customer path
+  // Q. Existing customer + hi on service_selection → greeting reset (new booking)
   {
     await cleanupTestMobile(existingMobile);
     const sb = supabaseClient();
@@ -558,10 +599,11 @@ async function run() {
     const conv = await getConversation(existingMobile);
 
     log(
-      "Q. Existing customer path",
+      "Q. Existing customer + hi → language_selection reset",
       ok &&
-        conv?.state === "service_selection" &&
-        conv?.context?.phase === "ready" &&
+        conv?.state === "language_selection" &&
+        conv?.context?.whatsapp_onboarding_started === true &&
+        !conv?.context?.service_id &&
         customer?.preferred_language === "en",
       `state=${conv?.state}`,
     );

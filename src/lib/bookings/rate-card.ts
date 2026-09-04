@@ -5,6 +5,7 @@ import {
 } from "@/lib/rate-cards/calculator";
 import { getActiveRateCardForService } from "@/lib/rate-cards/queries";
 import type { ServiceRateCard } from "@/lib/rate-cards/types";
+import { HOMIGO_SERVICE_BASE_PRICE } from "@/lib/whatsapp/homigo-services";
 
 export interface ActiveRateCardResult {
   card: ServiceRateCard | null;
@@ -41,5 +42,13 @@ export async function getActiveRateCard(
   }
 
   const amounts = calculateBookingAmounts(card);
-  return { card, amounts, error: null };
+  // Customer-facing service amount is always ₹1000 — DB splits must not change this.
+  return {
+    card,
+    amounts: {
+      ...amounts,
+      final_amount: HOMIGO_SERVICE_BASE_PRICE,
+    },
+    error: null,
+  };
 }

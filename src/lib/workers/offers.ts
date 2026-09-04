@@ -11,6 +11,7 @@ import {
   generateOfferAcceptToken,
   hashOfferAcceptToken,
 } from "./offer-tokens";
+import { workerLog } from "./worker-log";
 
 export interface CreatedOfferRecord {
   id: string;
@@ -79,6 +80,14 @@ export async function createWorkerOffersForBatch(
     if (error) {
       return { offers, devAcceptLinks, error: error.message };
     }
+
+    workerLog("WORKER-OFFER-CREATED", {
+      serviceRequestId: input.serviceRequestId,
+      offerId: String(data.id),
+      workerId,
+      batchNumber,
+      status: "pending",
+    });
 
     offers.push({
       id: String(data.id),
@@ -186,7 +195,22 @@ export async function startWorkerMatchingBatch1(
     };
   }
 
+  if (created.offers.length > 0) {
+    const { notifyWorkersForOffers } = await import("./notify-offer");
+    await notifyWorkersForOffers(supabase, {
+      serviceRequestId: input.serviceRequestId,
+      offers: created.offers,
+    });
+  }
+
   const batch = await getBatchStatus(supabase, input.serviceRequestId, 1);
+
+  workerLog("WORKER-BATCH-CREATED", {
+    serviceRequestId: input.serviceRequestId,
+    batchNumber: 1,
+    status: batch.data.status,
+    result: `offers=${created.offers.length}`,
+  });
 
   return {
     batch: batch.data,

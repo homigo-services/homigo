@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServiceClient } from "@/lib/supabase-server";
-import { acceptWorkerOfferByToken } from "@/lib/workers/offer-acceptance";
 import {
-  finalizeBookingAfterWorkerAccept,
-  tryFinalizeExistingAssignment,
-} from "@/lib/whatsapp/booking-confirmation";
+  acceptWorkerOfferByToken,
+  finalizeWorkerOfferAcceptance,
+} from "@/lib/workers/offer-actions";
 
 function htmlPage(title: string, body: string, ok: boolean): NextResponse {
   const color = ok ? "#059669" : "#dc2626";
@@ -12,42 +11,6 @@ function htmlPage(title: string, body: string, ok: boolean): NextResponse {
     `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:system-ui;max-width:32rem;margin:2rem auto;padding:1rem"><h1 style="color:${color}">${title}</h1><p>${body}</p></body></html>`,
     { status: ok ? 200 : 400, headers: { "Content-Type": "text/html; charset=utf-8" } },
   );
-}
-
-async function finalizeAfterAccept(
-  serviceRequestId: string,
-  bookingId: string,
-  workerId: string,
-): Promise<void> {
-  let supabase;
-  try {
-    supabase = createSupabaseServiceClient();
-  } catch {
-    return;
-  }
-
-  const result = await finalizeBookingAfterWorkerAccept(supabase, {
-    serviceRequestId,
-    bookingId,
-    workerId,
-  });
-
-  if (!result.ok && result.error) {
-    console.error("[worker-offer] finalize booking failed:", result.error);
-  }
-}
-
-async function recoverFinalize(serviceRequestId: string | undefined): Promise<void> {
-  if (!serviceRequestId) return;
-
-  let supabase;
-  try {
-    supabase = createSupabaseServiceClient();
-  } catch {
-    return;
-  }
-
-  await tryFinalizeExistingAssignment(supabase, serviceRequestId);
 }
 
 /** Worker offer acceptance — GET shows simple HTML; POST returns JSON. */
@@ -66,14 +29,9 @@ export async function GET(
 
   const result = await acceptWorkerOfferByToken(supabase, decodeURIComponent(token));
 
-  if (!result.ok) {
-    if (
-      result.error === "already_accepted" ||
-      result.error === "worker_already_assigned"
-    ) {
-      await recoverFinalize(result.serviceRequestId);
-    }
+  await finalizeWorkerOfferAcceptance(supabase, result);
 
+  if (!result.ok) {
     const messages: Record<string, string> = {
       invalid_token: "This accept link is invalid.",
       offer_expired: "This offer has expired.",
@@ -87,14 +45,6 @@ export async function GET(
       "Offer not accepted",
       messages[result.error ?? "unknown"] ?? result.message ?? "Unable to accept offer.",
       false,
-    );
-  }
-
-  if (result.serviceRequestId && result.bookingId && result.workerId) {
-    await finalizeAfterAccept(
-      result.serviceRequestId,
-      result.bookingId,
-      result.workerId,
     );
   }
 
@@ -126,25 +76,12 @@ export async function POST(
 
   const result = await acceptWorkerOfferByToken(supabase, decodeURIComponent(token));
 
-  if (!result.ok) {
-    if (
-      result.error === "already_accepted" ||
-      result.error === "worker_already_assigned"
-    ) {
-      await recoverFinalize(result.serviceRequestId);
-    }
+  await finalizeWorkerOfferAcceptance(supabase, result);
 
+  if (!result.ok) {
     return NextResponse.json(
       { success: false, error: result.error, message: result.message },
       { status: 400 },
-    );
-  }
-
-  if (result.serviceRequestId && result.bookingId && result.workerId) {
-    await finalizeAfterAccept(
-      result.serviceRequestId,
-      result.bookingId,
-      result.workerId,
     );
   }
 

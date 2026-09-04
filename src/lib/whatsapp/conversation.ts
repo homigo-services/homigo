@@ -4,38 +4,43 @@ import type {
   WhatsappConversation,
   WhatsappConversationState,
 } from "./types";
+import { buildFreshOnboardingContext, buildLanguageSelectedContext } from "./context-builders";
+import {
+  CONVERSATION_PHASE_READY,
+  type ConversationContext,
+} from "./conversation-context";
 import { normalizeWhatsAppMobile } from "./parser";
 
 const TABLE = "whatsapp_conversations";
 
-/** Context flag: language onboarding complete; awaiting service selection (Phase 4). */
-export const CONVERSATION_PHASE_READY = "ready";
+export { CONVERSATION_PHASE_READY, type ConversationContext } from "./conversation-context";
 
-export interface ConversationContext {
-  phase?: typeof CONVERSATION_PHASE_READY | string;
-  language_confirmed_at?: string;
-  /** True once we've sent the language menu during WhatsApp onboarding. */
-  whatsapp_onboarding_started?: boolean;
-  /** Cached numbered service menu entries for selection parsing. */
-  service_menu?: Array<{ index: number; id: string; name: string }>;
-  service_id?: string;
-  service_name?: string;
-  collecting_field?: "area" | "pincode" | "address_line";
-  original_message?: string;
-  service_date?: string;
-  preferred_time_slot?: string;
-  service_request_id?: string;
-  rate_card_id?: string;
-  confirmation_sent_at?: string;
-  booking_ref?: string;
-  final_amount?: number;
-  assigned_worker_id?: string;
-  matching_status?: string;
-  booking_id?: string;
-  payment_mode?: string;
-  payment_mode_selected_at?: string;
-  [key: string]: unknown;
-}
+/** Booking-flow fields that must not leak into a fresh onboarding reset. */
+const STALE_BOOKING_CONTEXT_KEYS = [
+  "service_menu",
+  "service_id",
+  "service_name",
+  "collecting_field",
+  "original_message",
+  "service_date",
+  "preferred_time_slot",
+  "service_request_id",
+  "rate_card_id",
+  "confirmation_sent_at",
+  "booking_ref",
+  "final_amount",
+  "assigned_worker_id",
+  "matching_status",
+  "booking_id",
+  "payment_mode",
+  "payment_mode_selected_at",
+  "matching_batch",
+  "offer_count",
+  "dev_accept_links",
+  "otp_verified_at",
+  "cash_completion_sent_at",
+  "payment_status",
+] as const;
 
 function normalize(row: Record<string, unknown>): WhatsappConversation {
   return row as unknown as WhatsappConversation;
@@ -48,15 +53,43 @@ export function isConversationReady(
   return ctx.phase === CONVERSATION_PHASE_READY;
 }
 
-export async function getConversationByMobile(
+/** Strip stale booking/matching fields when resetting or re-entering onboarding. */
+export function stripStaleBookingContext(
+  ctx: ConversationContext,
+): ConversationContext {
+  const next: ConversationContext = { ...ctx };
+  for (const key of STALE_BOOKING_CONTEXT_KEYS) {
+    delete next[key];
+  }
+  return next;
+}
+
+export function freshOnboardingContext(
+  overrides: Partial<ConversationContext> = {},
+): ConversationContext {
+  return buildFreshOnboardingContext(overrides);
+}
+
+export function readyLanguageContext(
+  ctx: ConversationContext,
+  language: CustomerPreferredLanguage,
+): ConversationContext {
+  return {
+    whatsapp_onboarding_started: ctx.whatsapp_onboarding_started,
+    language_confirmed_at: new Date().toISOString(),
+    phase: CONVERSATION_PHASE_READY,
+  };
+}
+
+/** Re-fetch conversation row after state-changing operations. */
+export async function refreshConversation(
   supabase: SupabaseClient,
-  rawMobile: string,
+  conversationId: string,
 ): Promise<{ data: WhatsappConversation | null; error: string | null }> {
-  const mobile = normalizeWhatsAppMobile(rawMobile);
   const { data, error } = await supabase
     .from(TABLE)
     .select("*")
-    .eq("whatsapp_mobile", mobile)
+    .eq("id", conversationId)
     .maybeSingle();
 
   if (error) {
@@ -67,6 +100,58 @@ export async function getConversationByMobile(
     data: data ? normalize(data as Record<string, unknown>) : null,
     error: null,
   };
+}
+
+export async function getConversationByMobile(
+  supabase: SupabaseClient,
+  rawMobile: string,
+): Promise<{ data: WhatsappConversation | null; error: string | null }> {
+  const mobile = normalizeWhatsAppMobile(rawMobile);
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("*")
+    .eq("whatsapp_mobile", mobile)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return { data: null, error: error.message };
+  }
+
+  return {
+    data: data ? normalize(data as Record<string, unknown>) : null,
+    error: null,
+  };
+}
+
+/** Resolve customer WhatsApp conversation by mobile, falling back to customer_id. */
+export async function getConversationForCustomer(
+  supabase: SupabaseClient,
+  input: { mobile?: string | null; customerId?: string | null },
+): Promise<{ data: WhatsappConversation | null; error: string | null }> {
+  if (input.mobile) {
+    const byMobile = await getConversationByMobile(supabase, input.mobile);
+    if (byMobile.data) return byMobile;
+  }
+
+  if (input.customerId) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select("*")
+      .eq("customer_id", input.customerId)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return { data: null, error: error.message };
+    return {
+      data: data ? normalize(data as Record<string, unknown>) : null,
+      error: null,
+    };
+  }
+
+  return { data: null, error: null };
 }
 
 export async function ensureConversation(
@@ -94,7 +179,7 @@ export async function ensureConversation(
       customer_id: customerId,
       preferred_language: preferredLanguage,
       state: "language_selection" satisfies WhatsappConversationState,
-      context: {},
+      context: buildFreshOnboardingContext({ whatsapp_onboarding_started: false }),
       updated_at: now,
     })
     .select("*")
@@ -167,11 +252,12 @@ export async function markConversationReady(
   return updateConversation(supabase, conversation.id, {
     state: "service_selection",
     preferred_language: language,
-    context: {
-      ...(conversation.context as ConversationContext),
-      phase: CONVERSATION_PHASE_READY,
-      language_confirmed_at: new Date().toISOString(),
-    },
+    service_request_id: null,
+    booking_id: null,
+    context: buildLanguageSelectedContext(
+      language,
+      (conversation.context as ConversationContext).whatsapp_onboarding_started ?? true,
+    ),
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
   });
@@ -201,9 +287,7 @@ export async function resetConversationForNewBooking(
     booking_id: null,
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
-    context: {
-      whatsapp_onboarding_started: true,
-    },
+    context: freshOnboardingContext(),
   });
 }
 

@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { AdminShell } from "@/components/admin/AdminShell";
+import { AdminLayoutRouter } from "@/components/admin/AdminLayoutRouter";
 
 export const metadata: Metadata = {
   title: "Admin Dashboard | Homigo",
@@ -11,5 +11,5 @@ export default function AdminLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  return <AdminShell>{children}</AdminShell>;
+  return <AdminLayoutRouter>{children}</AdminLayoutRouter>;
 }

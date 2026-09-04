@@ -286,8 +286,8 @@ async function cleanupSr(srId) {
 async function createTestSr(serviceName, area, pincode) {
   const sb = supabaseClient();
   if (!sb) throw new Error("Supabase client not configured");
-  const mobile = `919999666${String(Date.now()).slice(-4)}`;
-  const { data: customer } = await sb
+  const mobile = `919999666${randomBytes(4).toString("hex").slice(0, 4)}`;
+  const { data: customer, error: customerError } = await sb
     .from("customers")
     .insert({
       name: "P4B Test",
@@ -303,6 +303,10 @@ async function createTestSr(serviceName, area, pincode) {
     })
     .select("*")
     .single();
+
+  if (customerError || !customer?.id) {
+    throw new Error(`customer insert failed: ${customerError?.message ?? "unknown"}`);
+  }
 
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -457,8 +461,8 @@ async function run() {
   );
 
   log(
-    "E. Maximum 5 workers",
-    (matchRes.json.workers?.length ?? 0) <= 5,
+    "E. Maximum 3 workers per batch",
+    (matchRes.json.workers?.length ?? 0) <= 3,
     `count=${matchRes.json.workers?.length ?? 0}`,
   );
 
@@ -607,7 +611,7 @@ async function run() {
       );
       log(
         "Q. Booking financials",
-        Number(bookings?.[0]?.final_amount) === 550 && Number(bookings?.[0]?.base_amount) === 500,
+        Number(bookings?.[0]?.final_amount) === 1000,
         `final=${bookings?.[0]?.final_amount}`,
       );
 

@@ -1,3 +1,5 @@
+import { isWhatsappMockSendEnabled as isWhatsappMockSendEnabledRuntime } from "@/lib/env/runtime";
+
 /** Meta Graph API version for WhatsApp Cloud API. */
 export const WHATSAPP_GRAPH_API_VERSION =
   process.env.WHATSAPP_GRAPH_API_VERSION ?? "v21.0";
@@ -68,5 +70,5 @@ export function assertWhatsappConfig(): {
 }
 
 export function isWhatsappMockSendEnabled(): boolean {
-  return process.env.WHATSAPP_MOCK_SEND === "true";
+  return isWhatsappMockSendEnabledRuntime();
 }

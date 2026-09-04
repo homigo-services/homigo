@@ -5,8 +5,9 @@ import {
   requestCompletionOtp,
   type RequestCompletionOtpResult,
 } from "@/lib/bookings/completion-otp";
-import { getConversationByMobile, updateConversation } from "@/lib/whatsapp/conversation";
+import { getConversationForCustomer, updateConversation } from "@/lib/whatsapp/conversation";
 import { sendWhatsAppText } from "@/lib/whatsapp/client";
+import { canExposeDevOtpInApi, isWhatsappMockSendEnabled } from "@/lib/env/runtime";
 import { completionOtpCustomerMessage } from "@/lib/whatsapp/completion-messages";
 
 export interface CompleteOtpRequestResult extends RequestCompletionOtpResult {
@@ -49,7 +50,16 @@ export async function executeCompletionOtpRequest(
       ? customer.preferred_language
       : "mr");
 
-  const conv = await getConversationByMobile(supabase, result.customerMobile);
+  const { data: bookingRow } = await supabase
+    .from("booking")
+    .select("customer_id")
+    .eq("id", input.bookingId)
+    .maybeSingle();
+
+  const conv = await getConversationForCustomer(supabase, {
+    mobile: result.customerMobile,
+    customerId: bookingRow?.customer_id ? String(bookingRow.customer_id) : null,
+  });
   if (conv.data) {
     await updateConversation(supabase, conv.data.id, {
       state: "service_completion",
@@ -58,7 +68,7 @@ export async function executeCompletionOtpRequest(
         ...(conv.data.context as Record<string, unknown>),
         phase: "otp_pending",
         booking_id: input.bookingId,
-        ...(process.env.WHATSAPP_MOCK_SEND === "true"
+        ...(canExposeDevOtpInApi() && isWhatsappMockSendEnabled()
           ? { dev_completion_otp: rawOtp }
           : {}),
       },
@@ -70,7 +80,7 @@ export async function executeCompletionOtpRequest(
 
   return {
     ...result,
-    ...(process.env.WHATSAPP_MOCK_SEND === "true" ? { devOtp: rawOtp } : {}),
+    ...(canExposeDevOtpInApi() && isWhatsappMockSendEnabled() ? { devOtp: rawOtp } : {}),
     messageSent: send.ok,
   };
 }

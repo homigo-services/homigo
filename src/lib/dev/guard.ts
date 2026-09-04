@@ -1,8 +1,9 @@
 import { notFound } from "next/navigation";
+import { isNonProductionRuntime } from "@/lib/env/runtime";
 
-/** True when running Next.js dev server or non-production build context. */
+/** True only during local development/test — never in production. */
 export function isDevEnvironment(): boolean {
-  return process.env.NODE_ENV !== "production";
+  return isNonProductionRuntime();
 }
 
 /** Call in dev-only pages/routes — returns 404 in production. */

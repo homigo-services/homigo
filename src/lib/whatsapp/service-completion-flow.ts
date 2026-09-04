@@ -1,25 +1,24 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { CustomerPreferredLanguage } from "@/lib/customers/types";
 import type { PaymentMode } from "@/lib/bookings/types";
-import { verifyCompletionOtp, parseOtpFromText } from "@/lib/bookings/completion-otp";
 import { sendWhatsAppText } from "./client";
 import { type ConversationContext, updateConversation } from "./conversation";
 import {
-  alreadyVerifiedOtpMessage,
   bookingConfirmedAwaitOtpMessage,
-  cardPaymentPendingMessage,
   cashPaymentPendingMessage,
-  completionVerifiedMessage,
-  expiredOtpMessage,
+  customerAwaitingWorkerOtpMessage,
   invalidPaymentModeReply,
   noOtpPendingMessage,
-  otpVerificationPrompt,
   paymentModeAlreadySelectedMessage,
   paymentModeMenu,
   paymentModeSavedMessage,
-  tooManyOtpAttemptsMessage,
-  wrongOtpMessage,
+  upiPaymentLinkMessage,
+  upiPaymentPendingMessage,
 } from "./completion-messages";
+import {
+  HOMIGO_CASH_PAYMENT_AMOUNT,
+  HOMIGO_UPI_PAYMENT_AMOUNT,
+} from "./homigo-services";
 import type { WhatsappConversation } from "./types";
 
 export interface ServiceFlowResult {
@@ -28,10 +27,14 @@ export interface ServiceFlowResult {
   error?: string;
 }
 
-export type StoredPaymentMode = "cash" | "card";
+export type StoredPaymentMode = "cash" | "upi";
 
 function bookingRefFromId(bookingId: string): string {
   return bookingId.replace(/-/g, "").slice(0, 8).toUpperCase();
+}
+
+function paymentFinalAmount(mode: StoredPaymentMode): number {
+  return mode === "cash" ? HOMIGO_CASH_PAYMENT_AMOUNT : HOMIGO_UPI_PAYMENT_AMOUNT;
 }
 
 async function loadBookingForConversation(
@@ -47,7 +50,7 @@ async function loadBookingForConversation(
   const { data, error } = await supabase
     .from("booking")
     .select(
-      "id, Payment_mode, payment_status, payment_received_at, customer_id, otp_verified, completion_otp_hash, otp_expires_at, otp_attempts",
+      "id, Payment_mode, payment_status, payment_received_at, customer_id, otp_verified, completion_otp_hash, otp_expires_at, otp_attempts, final_amount",
     )
     .eq("id", bookingId)
     .maybeSingle();
@@ -67,14 +70,14 @@ async function loadBookingForConversation(
 function normalizePaymentMode(value: string | null | undefined): StoredPaymentMode | null {
   const v = String(value ?? "").trim().toLowerCase();
   if (v === "cash") return "cash";
-  if (v === "card") return "card";
+  if (v === "upi") return "upi";
   return null;
 }
 
 export function parsePaymentModeSelection(text: string): StoredPaymentMode | null {
   const t = text.trim().toLowerCase();
   if (t === "1" || t === "cash") return "cash";
-  if (t === "2" || t === "card") return "card";
+  if (t === "2" || t === "upi") return "upi";
   return null;
 }
 
@@ -83,10 +86,12 @@ async function savePaymentMode(
   bookingId: string,
   mode: StoredPaymentMode,
 ): Promise<string | null> {
+  const finalAmount = paymentFinalAmount(mode);
   const { error } = await supabase
     .from("booking")
     .update({
       Payment_mode: mode satisfies PaymentMode,
+      final_amount: finalAmount,
       payment_status: "pending",
       updated_at: new Date().toISOString(),
     })
@@ -146,7 +151,7 @@ export async function handleServiceInProgressInbound(
   return { handled: true, replied: send.ok };
 }
 
-/** service_completion — OTP verify or payment selection after verify. */
+/** service_completion — customer waits for worker OTP verify; payment only after verify. */
 export async function handleServiceCompletionInbound(
   supabase: SupabaseClient,
   conversation: WhatsappConversation,
@@ -180,66 +185,18 @@ export async function handleServiceCompletionInbound(
     );
   }
 
-  const otp = parseOtpFromText(text);
-  if (!otp) {
-    const body =
-      text.trim().length > 0 ? otpVerificationPrompt(lang) : otpVerificationPrompt(lang);
-    const send = await sendWhatsAppText(customerMobile, body);
-    await updateConversation(supabase, conversation.id, {
-      state: "service_completion",
-      last_message_id: messageId,
-      last_message_at: new Date().toISOString(),
-      context: { ...ctx, phase: "otp_pending" },
-    });
-    return { handled: true, replied: send.ok };
-  }
-
-  const verified = await verifyCompletionOtp(supabase, {
-    bookingId: booking.id,
-    customerId: String(booking.customer_id),
-    rawOtp: otp,
-  });
-
-  if (verified.alreadyVerified) {
-    const send = await sendWhatsAppText(customerMobile, alreadyVerifiedOtpMessage(lang));
-    return handlePaymentSelectionInbound(
-      supabase,
-      conversation,
-      customerMobile,
-      lang,
-      messageId,
-      "",
-    ).then((r) => ({ ...r, replied: send.ok || r.replied }));
-  }
-
-  if (!verified.ok) {
-    let body: string;
-    if (verified.error === "expired") body = expiredOtpMessage(lang);
-    else if (verified.error === "too_many_attempts") body = tooManyOtpAttemptsMessage(lang);
-    else if (verified.error === "invalid_otp")
-      body = wrongOtpMessage(lang, verified.attemptsRemaining ?? 0);
-    else body = noOtpPendingMessage(lang);
-
-    const send = await sendWhatsAppText(customerMobile, body);
-    await updateConversation(supabase, conversation.id, {
-      state: "service_completion",
-      last_message_id: messageId,
-      last_message_at: new Date().toISOString(),
-      context: { ...ctx, phase: "otp_pending" },
-    });
-    return { handled: true, replied: send.ok };
-  }
-
-  const menu = `${completionVerifiedMessage(lang)}\n\n${paymentModeMenu(lang)}`;
-  const send = await sendWhatsAppText(customerMobile, menu);
+  // Customer must NOT enter OTP — worker verifies via authenticated flow.
+  const body = customerAwaitingWorkerOtpMessage(lang);
+  const send = await sendWhatsAppText(customerMobile, body);
   await updateConversation(supabase, conversation.id, {
     state: "service_completion",
+    booking_id: booking.id,
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
     context: {
       ...ctx,
-      phase: "payment_selection",
-      otp_verified_at: new Date().toISOString(),
+      phase: "otp_pending",
+      booking_id: booking.id,
     },
   });
   return { handled: true, replied: send.ok };
@@ -258,7 +215,7 @@ export async function handlePaymentSelectionInbound(
   const loaded = await loadBookingForConversation(supabase, conversation);
 
   if (!loaded.booking?.otp_verified) {
-    const send = await sendWhatsAppText(customerMobile, otpVerificationPrompt(lang));
+    const send = await sendWhatsAppText(customerMobile, customerAwaitingWorkerOtpMessage(lang));
     await updateConversation(supabase, conversation.id, {
       state: "service_completion",
       last_message_id: messageId,
@@ -273,18 +230,20 @@ export async function handlePaymentSelectionInbound(
   const existingMode = normalizePaymentMode(booking.Payment_mode);
 
   if (existingMode) {
+    const amount = paymentFinalAmount(existingMode);
     const body = paymentModeAlreadySelectedMessage(lang, {
       bookingRef,
       mode: existingMode,
+      amount,
     });
     const send = await sendWhatsAppText(customerMobile, body);
     const phase =
-      existingMode === "cash" ? "cash_payment_pending" : "card_payment_pending";
+      existingMode === "cash" ? "cash_payment_pending" : "upi_payment_pending";
     await updateConversation(supabase, conversation.id, {
       state: "payment_pending",
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
-      context: { ...ctx, phase, payment_mode: existingMode },
+      context: { ...ctx, phase, payment_mode: existingMode, final_amount: amount },
     });
     return { handled: true, replied: send.ok };
   }
@@ -305,9 +264,32 @@ export async function handlePaymentSelectionInbound(
   const saveError = await savePaymentMode(supabase, booking.id, selected);
   if (saveError) return { handled: false, replied: false, error: saveError };
 
-  const body = paymentModeSavedMessage(lang, { bookingRef, mode: selected });
+  const amount = paymentFinalAmount(selected);
+  let body = paymentModeSavedMessage(lang, { bookingRef, mode: selected, amount });
+
+  if (selected === "upi") {
+    const { data: customer } = await supabase
+      .from("customers")
+      .select("mobile")
+      .eq("id", booking.customer_id)
+      .maybeSingle();
+
+    const { initiateUpiPaymentForBooking } = await import("@/lib/payments/upi-payment");
+    const upi = await initiateUpiPaymentForBooking(supabase, {
+      bookingId: booking.id,
+      customerMobile: String(customer?.mobile ?? customerMobile),
+      amountInr: amount,
+    });
+
+    if (upi.ok && upi.paymentLinkUrl) {
+      body = upiPaymentLinkMessage(lang, { bookingRef, amount, url: upi.paymentLinkUrl });
+    } else if (upi.error) {
+      body = `${body}\n\n(UPI link unavailable: ${upi.error})`;
+    }
+  }
+
   const send = await sendWhatsAppText(customerMobile, body);
-  const phase = selected === "cash" ? "cash_payment_pending" : "card_payment_pending";
+  const phase = selected === "cash" ? "cash_payment_pending" : "upi_payment_pending";
   await updateConversation(supabase, conversation.id, {
     state: "payment_pending",
     last_message_id: messageId,
@@ -316,13 +298,14 @@ export async function handlePaymentSelectionInbound(
       ...ctx,
       phase,
       payment_mode: selected,
+      final_amount: amount,
       payment_mode_selected_at: new Date().toISOString(),
     },
   });
   return { handled: true, replied: send.ok };
 }
 
-/** payment_pending — cash/card pending; stable replies. */
+/** payment_pending — cash/upi pending; stable replies. */
 export async function handlePaymentPendingInbound(
   supabase: SupabaseClient,
   conversation: WhatsappConversation,
@@ -366,10 +349,12 @@ export async function handlePaymentPendingInbound(
   }
 
   if (mode) {
+    const amount =
+      Number(ctx.final_amount) || paymentFinalAmount(mode);
     const body =
       mode === "cash"
-        ? cashPaymentPendingMessage(lang, bookingRef)
-        : cardPaymentPendingMessage(lang, bookingRef);
+        ? cashPaymentPendingMessage(lang, bookingRef, amount)
+        : upiPaymentPendingMessage(lang, bookingRef, amount);
     const send = await sendWhatsAppText(customerMobile, body);
     await updateConversation(supabase, conversation.id, {
       state: "payment_pending",
