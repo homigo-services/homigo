@@ -24,7 +24,16 @@ export function unauthorizedImportResponse() {
  * Falls back to same-origin /admin referer check for the admin panel.
  */
 export function verifyAdminApiRequest(request: Request): boolean {
-  const secret = process.env.ADMIN_API_SECRET;
+  const secret = process.env.ADMIN_API_SECRET?.trim();
+
+  if (process.env.NODE_ENV === "production") {
+    if (!secret) return false;
+    const authHeader = request.headers.get("authorization");
+    const customHeader = request.headers.get("x-admin-secret");
+    if (authHeader === `Bearer ${secret}`) return true;
+    if (customHeader === secret) return true;
+    return false;
+  }
 
   if (secret) {
     const authHeader = request.headers.get("authorization");
@@ -34,12 +43,7 @@ export function verifyAdminApiRequest(request: Request): boolean {
     return false;
   }
 
-  if (process.env.NODE_ENV !== "production") {
-    return true;
-  }
-
-  const referer = request.headers.get("referer") ?? "";
-  return referer.includes("/admin/");
+  return true;
 }
 
 export function unauthorizedAdminResponse() {

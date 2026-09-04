@@ -10,6 +10,7 @@ import {
   tryClaimWebhookEvent,
 } from "@/lib/whatsapp/conversation";
 import { normalizeWhatsAppMobile, parseWhatsAppWebhook } from "@/lib/whatsapp/parser";
+import { verifyWhatsAppWebhookSignature } from "@/lib/whatsapp/webhook-signature";
 
 function payloadHash(body: unknown): string {
   return createHash("sha256")
@@ -39,10 +40,27 @@ export async function GET(request: Request) {
 
 /** Meta webhook events (POST). */
 export async function POST(request: Request) {
-  let body: unknown;
+  const rawBody = await request.text();
+  const appSecret = process.env.WHATSAPP_APP_SECRET?.trim();
+  const signature = request.headers.get("x-hub-signature-256");
 
+  if (process.env.NODE_ENV === "production") {
+    if (!appSecret) {
+      console.error("[whatsapp] WHATSAPP_APP_SECRET missing in production");
+      return NextResponse.json({ success: false, error: "not_configured" }, { status: 503 });
+    }
+    if (!verifyWhatsAppWebhookSignature(rawBody, signature, appSecret)) {
+      return NextResponse.json({ success: false, error: "invalid_signature" }, { status: 401 });
+    }
+  } else if (appSecret && signature) {
+    if (!verifyWhatsAppWebhookSignature(rawBody, signature, appSecret)) {
+      return NextResponse.json({ success: false, error: "invalid_signature" }, { status: 401 });
+    }
+  }
+
+  let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody) as unknown;
   } catch {
     return NextResponse.json({ success: true });
   }

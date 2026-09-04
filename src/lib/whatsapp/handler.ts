@@ -4,27 +4,36 @@ import { sendWhatsAppText } from "./client";
 import {
   handleBookingFlow,
   isBookingFlowState,
+  logConversationStateAfter,
   sendPostLanguageServiceMenu,
   sendReturningCustomerServiceMenu,
 } from "./booking-flow";
 import {
   handleBookingConfirmedInbound,
   handlePaymentPendingInbound,
+  handlePaymentSelectionInbound,
   handleServiceCompletionInbound,
   handleServiceInProgressInbound,
 } from "./service-completion-flow";
+import { buildFreshOnboardingContext } from "./context-builders";
+import { withConversationLock } from "./conversation-lock";
 import {
   type ConversationContext,
   ensureConversation,
   freshOnboardingContext,
   isConversationReady,
   markConversationReady,
+  refreshConversation,
   resetConversationForNewBooking,
-  readyLanguageContext,
   updateConversation,
 } from "./conversation";
 import { upsertCustomerFromWhatsApp } from "./customer";
-import { waDebug } from "./debug-log";
+import { waContextSnapshot, waDebug } from "./debug-log";
+import {
+  conversationNeedsBookingHeal,
+  isOrphanConversationState,
+  shouldResetOnboardingGreeting,
+} from "./fsm-guards";
 import {
   COMPLETED_BOOKING_NUDGE,
   INVALID_LANGUAGE_SELECTION,
@@ -36,8 +45,9 @@ import {
 } from "./messages";
 import type { ParsedWhatsAppMessage } from "./parser";
 import { isGreeting, normalizeWhatsAppMobile } from "./parser";
-import { shouldSkipLanguageForReturningCustomer } from "./routing";
-import type { WhatsappConversationState } from "./types";
+import { applyConversationInactivityIfNeeded } from "./conversation-inactivity";
+import { shouldSkipLanguageForReturningCustomer, customerStateUsesNumericMenu } from "./routing";
+import type { WhatsappConversation, WhatsappConversationState } from "./types";
 
 export interface HandleMessageResult {
   handled: boolean;
@@ -68,12 +78,10 @@ function effectiveLanguage(customer: Customer): "en" | "mr" | "hi" {
   return "mr";
 }
 
-/** Greeting on completed state starts fresh onboarding instead of stale status replies. */
 function shouldRestartOnboardingForGreeting(state: WhatsappConversationState): boolean {
   return state === "completed";
 }
 
-/** WhatsApp-created customer not yet through profile collection. */
 function isIncompleteWhatsAppProfile(customer: Customer): boolean {
   return (
     customer.source === "whatsapp" &&
@@ -81,6 +89,30 @@ function isIncompleteWhatsAppProfile(customer: Customer): boolean {
     customer.pincode === "pending" &&
     customer.address_line === "pending"
   );
+}
+
+async function healConversationRow(
+  supabase: SupabaseClient,
+  conversation: { id: string; state: WhatsappConversationState },
+  messageId: string,
+  reason: string,
+) {
+  waDebug("BRANCH", {
+    messageId,
+    branch: reason,
+    state: conversation.state,
+  });
+
+  const reset = await updateConversation(supabase, conversation.id, {
+    state: "language_selection",
+    service_request_id: null,
+    booking_id: null,
+    context: freshOnboardingContext({
+      whatsapp_onboarding_started: false,
+    }),
+  });
+
+  return reset.data;
 }
 
 /**
@@ -132,14 +164,51 @@ export async function handleIncomingTextMessage(
     };
   }
 
-  let conversation = convResult.data;
+  return withConversationLock(
+    supabase,
+    mobile,
+    message.messageId,
+    () =>
+      processIncomingTextMessage(
+        supabase,
+        message,
+        mobile,
+        customer,
+        customerResult.created,
+        language,
+        convResult.data!,
+      ),
+  );
+}
+
+async function processIncomingTextMessage(
+  supabase: SupabaseClient,
+  message: ParsedWhatsAppMessage,
+  mobile: string,
+  customer: Customer,
+  customerCreated: boolean,
+  language: "en" | "mr" | "hi",
+  initialConversation: WhatsappConversation,
+): Promise<HandleMessageResult> {
+  const text = message.textBody?.trim() ?? "";
+
+  const refreshed = await refreshConversation(supabase, initialConversation.id);
+  let conversation: WhatsappConversation = refreshed.data ?? initialConversation;
+  if (!conversation) {
+    return { handled: false, replied: false, error: "Conversation not found after refresh" };
+  }
+
   let ctx = conversation.context as ConversationContext;
 
   waDebug("STATE", {
     messageId: message.messageId,
     mobile,
-    state: conversation.state,
+    stateBefore: conversation.state,
     phase: String(ctx.phase ?? ""),
+    contextSummary: waContextSnapshot(ctx),
+    collecting_field: String(ctx.collecting_field ?? ""),
+    service_id: String(ctx.service_id ?? ""),
+    service_date: String(ctx.service_date ?? ""),
   });
 
   if (conversation.customer_id !== customer.id) {
@@ -149,8 +218,60 @@ export async function handleIncomingTextMessage(
     if (linked.data) conversation = linked.data;
   }
 
-  // Heal stale rows stuck outside language onboarding (never during active booking flow)
+  // Worker offer accept/reject — never steal customer payment menu "1"/"2"
   if (
+    (text === "1" || text === "2") &&
+    !customerStateUsesNumericMenu(conversation.state, ctx)
+  ) {
+    const { handleWorkerWhatsAppMessage } = await import("@/lib/workers/worker-whatsapp");
+    const workerResult = await handleWorkerWhatsAppMessage(supabase, {
+      mobile,
+      text,
+      messageId: message.messageId,
+    });
+    if (workerResult.handled) {
+      return workerResult;
+    }
+  }
+
+  // 24h customer inactivity — reset stale conversational FSM (bookings untouched)
+  const inactivity = await applyConversationInactivityIfNeeded(
+    supabase,
+    conversation,
+    mobile,
+    message.messageId,
+  );
+  if (inactivity.conversation) {
+    conversation = inactivity.conversation;
+    ctx = conversation.context as ConversationContext;
+  }
+  if (inactivity.didReset) {
+    waDebug("BRANCH", {
+      messageId: message.messageId,
+      mobile,
+      branch: "inactivity_reset",
+      state: conversation.state,
+    });
+  }
+
+  // Heal corrupted booking step or orphan DB state before routing
+  if (
+    isOrphanConversationState(conversation.state) ||
+    conversationNeedsBookingHeal(conversation.state, ctx)
+  ) {
+    const healed = await healConversationRow(
+      supabase,
+      conversation,
+      message.messageId,
+      isOrphanConversationState(conversation.state)
+        ? "heal_orphan_state"
+        : "heal_corrupt_booking_state",
+    );
+    if (healed) {
+      conversation = healed;
+      ctx = conversation.context as ConversationContext;
+    }
+  } else if (
     isIncompleteWhatsAppProfile(customer) &&
     !isConversationReady(conversation) &&
     conversation.state !== "language_selection" &&
@@ -177,25 +298,34 @@ export async function handleIncomingTextMessage(
   }
 
   const lang = language;
+  const conversationId = conversation.id;
 
   async function sendOnboardingWelcome(messageId: string): Promise<HandleMessageResult> {
-    const send = await sendWhatsAppText(mobile, ONBOARDING_WELCOME_WITH_LANGUAGE);
     await updateConversation(supabase, conversation.id, {
       state: "language_selection",
+      service_request_id: null,
+      booking_id: null,
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
-      context: freshOnboardingContext(),
+      context: buildFreshOnboardingContext({ whatsapp_onboarding_started: true }),
     });
+    const send = await sendWhatsAppText(mobile, ONBOARDING_WELCOME_WITH_LANGUAGE);
     waDebug("OUT", {
       messageId,
       mobile,
       handler: "sendOnboardingWelcome",
       replied: send.ok,
     });
+    await logConversationStateAfter(supabase, conversationId, mobile, messageId);
     return { handled: true, replied: send.ok };
   }
 
-  // Greeting after completed booking — fresh onboarding (never during active matching)
+  async function finish(result: HandleMessageResult): Promise<HandleMessageResult> {
+    await logConversationStateAfter(supabase, conversationId, mobile, message.messageId);
+    return result;
+  }
+
+  // Completed booking + greeting → fresh onboarding
   if (isGreeting(text) && shouldRestartOnboardingForGreeting(conversation.state)) {
     waDebug("BRANCH", {
       messageId: message.messageId,
@@ -208,10 +338,27 @@ export async function handleIncomingTextMessage(
       message.messageId,
     );
     if (reset.data) conversation = reset.data;
-    return sendOnboardingWelcome(message.messageId);
+    return finish(await sendOnboardingWelcome(message.messageId));
   }
 
-  // worker_assignment — always booking flow (matching retry); never onboarding fallback
+  // Greeting during pre-worker booking states → always restart language onboarding
+  if (isGreeting(text) && shouldResetOnboardingGreeting(conversation.state)) {
+    waDebug("BRANCH", {
+      messageId: message.messageId,
+      mobile,
+      branch: "greeting_reset_booking_state",
+      state: conversation.state,
+    });
+    const reset = await resetConversationForNewBooking(
+      supabase,
+      conversation,
+      message.messageId,
+    );
+    if (reset.data) conversation = reset.data;
+    return finish(await sendOnboardingWelcome(message.messageId));
+  }
+
+  // worker_assignment — always booking flow; never reset on greeting
   if (conversation.state === "worker_assignment") {
     waDebug("ROUTE", {
       messageId: message.messageId,
@@ -219,17 +366,18 @@ export async function handleIncomingTextMessage(
       handler: "handleBookingFlow",
       state: conversation.state,
     });
-    return handleBookingFlow({
-      supabase,
-      customer,
-      conversation,
-      messageId: message.messageId,
-      text,
-      lang,
-    });
+    return finish(
+      await handleBookingFlow({
+        supabase,
+        customer,
+        conversation,
+        messageId: message.messageId,
+        text,
+        lang,
+      }),
+    );
   }
 
-  // Finished booking — non-greeting status only (greeting handled above)
   if (conversation.state === "completed") {
     const send = await sendWhatsAppText(mobile, COMPLETED_BOOKING_NUDGE[lang]);
     await updateConversation(supabase, conversation.id, {
@@ -242,22 +390,23 @@ export async function handleIncomingTextMessage(
       handler: "completed_nudge",
       replied: send.ok,
     });
-    return { handled: true, replied: send.ok };
+    return finish({ handled: true, replied: send.ok });
   }
 
-  // Post-assignment: service completion OTP → payment selection / pending payment
   if (conversation.state === "payment_pending") {
     waDebug("ROUTE", {
       messageId: message.messageId,
       mobile,
       handler: "handlePaymentPendingInbound",
     });
-    return handlePaymentPendingInbound(
-      supabase,
-      conversation,
-      mobile,
-      lang,
-      message.messageId,
+    return finish(
+      await handlePaymentPendingInbound(
+        supabase,
+        conversation,
+        mobile,
+        lang,
+        message.messageId,
+      ),
     );
   }
 
@@ -267,13 +416,15 @@ export async function handleIncomingTextMessage(
       mobile,
       handler: "handleServiceCompletionInbound",
     });
-    return handleServiceCompletionInbound(
-      supabase,
-      conversation,
-      mobile,
-      lang,
-      message.messageId,
-      text,
+    return finish(
+      await handleServiceCompletionInbound(
+        supabase,
+        conversation,
+        mobile,
+        lang,
+        message.messageId,
+        text,
+      ),
     );
   }
 
@@ -283,32 +434,85 @@ export async function handleIncomingTextMessage(
       mobile,
       handler: "handleServiceInProgressInbound",
     });
-    return handleServiceInProgressInbound(
-      supabase,
-      conversation,
-      mobile,
-      lang,
-      message.messageId,
-      text,
+    return finish(
+      await handleServiceInProgressInbound(
+        supabase,
+        conversation,
+        mobile,
+        lang,
+        message.messageId,
+        text,
+      ),
     );
   }
 
   if (conversation.state === "booking_confirmed") {
+    const bookingId =
+      conversation.booking_id ??
+      ((conversation.context as ConversationContext).booking_id as string | undefined);
+
+    if (bookingId) {
+      const { data: bookingRow } = await supabase
+        .from("booking")
+        .select("otp_verified, completion_otp_hash")
+        .eq("id", bookingId)
+        .maybeSingle();
+
+      if (bookingRow?.otp_verified) {
+        const ctx = conversation.context as ConversationContext;
+        const synced = await updateConversation(supabase, conversation.id, {
+          state: "service_completion",
+          booking_id: bookingId,
+          context: { ...ctx, phase: "payment_selection", booking_id: bookingId },
+        });
+        return finish(
+          await handlePaymentSelectionInbound(
+            supabase,
+            synced.data ?? conversation,
+            mobile,
+            lang,
+            message.messageId,
+            text,
+          ),
+        );
+      }
+
+      if (bookingRow?.completion_otp_hash && !bookingRow.otp_verified) {
+        const ctx = conversation.context as ConversationContext;
+        const synced = await updateConversation(supabase, conversation.id, {
+          state: "service_completion",
+          booking_id: bookingId,
+          context: { ...ctx, phase: "otp_pending", booking_id: bookingId },
+        });
+        return finish(
+          await handleServiceCompletionInbound(
+            supabase,
+            synced.data ?? conversation,
+            mobile,
+            lang,
+            message.messageId,
+            text,
+          ),
+        );
+      }
+    }
+
     waDebug("ROUTE", {
       messageId: message.messageId,
       mobile,
       handler: "handleBookingConfirmedInbound",
     });
-    return handleBookingConfirmedInbound(
-      supabase,
-      conversation,
-      mobile,
-      lang,
-      message.messageId,
+    return finish(
+      await handleBookingConfirmedInbound(
+        supabase,
+        conversation,
+        mobile,
+        lang,
+        message.messageId,
+      ),
     );
   }
 
-  // Phase 4A booking flow (service selection onward)
   if (isBookingFlowState(conversation.state)) {
     waDebug("ROUTE", {
       messageId: message.messageId,
@@ -316,20 +520,21 @@ export async function handleIncomingTextMessage(
       handler: "handleBookingFlow",
       state: conversation.state,
     });
-    return handleBookingFlow({
-      supabase,
-      customer,
-      conversation,
-      messageId: message.messageId,
-      text,
-      lang,
-    });
+    return finish(
+      await handleBookingFlow({
+        supabase,
+        customer,
+        conversation,
+        messageId: message.messageId,
+        text,
+        lang,
+      }),
+    );
   }
 
-  // WhatsApp onboarding — language selection flow (must run before returning-customer shortcut)
   if (conversation.state === "language_selection") {
     if (isGreeting(text)) {
-      return sendOnboardingWelcome(message.messageId);
+      return finish(await sendOnboardingWelcome(message.messageId));
     }
 
     const selected = parseLanguageSelection(text);
@@ -339,11 +544,7 @@ export async function handleIncomingTextMessage(
         mobile,
         branch: "language_selected",
       });
-      const langError = await saveCustomerLanguage(
-        supabase,
-        customer.id,
-        selected,
-      );
+      const langError = await saveCustomerLanguage(supabase, customer.id, selected);
       if (langError) {
         console.error("[whatsapp] language save failed:", langError);
         return { handled: false, replied: false, error: langError };
@@ -359,18 +560,19 @@ export async function handleIncomingTextMessage(
         return { handled: false, replied: false, error: updated.error };
       }
 
-      return sendPostLanguageServiceMenu(
-        supabase,
-        customer,
-        updated.data ?? conversation,
-        selected,
-        message.messageId,
+      return finish(
+        await sendPostLanguageServiceMenu(
+          supabase,
+          customer,
+          updated.data ?? conversation,
+          selected,
+          message.messageId,
+        ),
       );
     }
 
-    // Returning customer with completed language onboarding — skip language menu only when safe
     const isExistingProfileWithLanguage =
-      !customerResult.created &&
+      !customerCreated &&
       isValidPreferredLanguage(customer.preferred_language) &&
       !ctx.whatsapp_onboarding_started &&
       !isIncompleteWhatsAppProfile(customer);
@@ -399,13 +601,15 @@ export async function handleIncomingTextMessage(
         if (ready.data) conversation = ready.data;
       }
 
-      return sendReturningCustomerServiceMenu(
-        supabase,
-        customer,
-        conversation,
-        lang,
-        message.messageId,
-        isGreeting(text),
+      return finish(
+        await sendReturningCustomerServiceMenu(
+          supabase,
+          customer,
+          conversation,
+          lang,
+          message.messageId,
+          isGreeting(text),
+        ),
       );
     }
 
@@ -428,7 +632,7 @@ export async function handleIncomingTextMessage(
         handler: "invalid_language",
         replied: send.ok,
       });
-      return { handled: true, replied: send.ok };
+      return finish({ handled: true, replied: send.ok });
     }
   }
 
@@ -438,7 +642,7 @@ export async function handleIncomingTextMessage(
     branch: "fallback_onboarding",
     state: conversation.state,
   });
-  return sendOnboardingWelcome(message.messageId);
+  return finish(await sendOnboardingWelcome(message.messageId));
 }
 
 export async function handleUnsupportedMessageType(

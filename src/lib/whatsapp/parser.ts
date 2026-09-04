@@ -13,16 +13,6 @@ export interface ParsedWhatsAppWebhook {
   statuses: unknown[];
 }
 
-const GREETING_PATTERNS = [
-  /^hi+$/i,
-  /^hello+$/i,
-  /^hey+$/i,
-  /^namaste+$/i,
-  /^नमस्कार$/,
-  /^नमस्ते$/,
-  /^hii+$/i,
-];
-
 export function normalizeWhatsAppMobile(raw: string): string {
   const digits = raw.replace(/\D/g, "");
   if (digits.length === 10) {
@@ -34,7 +24,15 @@ export function normalizeWhatsAppMobile(raw: string): string {
 export function isGreeting(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
-  return GREETING_PATTERNS.some((pattern) => pattern.test(trimmed));
+  if (
+    /^(hi|hello|hey|namaste|hii|नमस्कार|नमस्ते)[!.?]*$/i.test(trimmed)
+  ) {
+    return true;
+  }
+  if (/^(hi|hello|hey)\s+\S/i.test(trimmed)) {
+    return true;
+  }
+  return false;
 }
 
 export function parseWhatsAppWebhook(body: unknown): ParsedWhatsAppWebhook {

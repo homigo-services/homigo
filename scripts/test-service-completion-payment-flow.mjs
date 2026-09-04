@@ -4,7 +4,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { setDefaultResultOrder } from "node:dns";
 import { readFileSync } from "node:fs";
@@ -202,8 +202,10 @@ async function setupConfirmedBooking(lang = "en") {
 
   await sb.from("workers").update({ is_available: true }).eq("id", worker.id);
 
-  const mobile = `919999333${String(Date.now()).slice(-4)}`;
-  const { data: customer } = await sb
+  const mobile = `9199${String(Date.now()).slice(-9)}${Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, "0")}`.slice(0, 15);
+  const { data: customer, error: customerError } = await sb
     .from("customers")
     .insert({
       name: "P5 Completion Test",
@@ -219,6 +221,10 @@ async function setupConfirmedBooking(lang = "en") {
     })
     .select("*")
     .single();
+
+  if (customerError || !customer?.id) {
+    throw new Error(`customer insert failed: ${customerError?.message ?? "unknown"}`);
+  }
 
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -283,11 +289,27 @@ async function setupConfirmedBooking(lang = "en") {
     await new Promise((r) => setTimeout(r, 200));
   }
 
+  const { data: assignedBooking } = await sb
+    .from("booking")
+    .select("booking_status, worker_id")
+    .eq("id", acceptJson.booking_id)
+    .maybeSingle();
+
+  if (!assignedBooking?.worker_id) {
+    throw new Error("Booking not assigned after worker accept");
+  }
+
+  const { data: assignedWorker } = await sb
+    .from("workers")
+    .select('id, pincode, area, is_available, is_verified, status')
+    .eq("id", assignedBooking.worker_id)
+    .maybeSingle();
+
   return {
     mobile,
     customer,
     sr,
-    worker,
+    worker: assignedWorker ?? worker,
     service,
     bookingId: acceptJson.booking_id,
   };
@@ -309,6 +331,50 @@ async function requestOtp(bookingId, workerId) {
     await new Promise((r) => setTimeout(r, 300));
   }
   return { res: lastRes, json: lastJson, ok: false };
+}
+
+async function createWorkerSession(workerId) {
+  const sb = supabaseClient();
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+  const expiresAt = new Date(Date.now() + 72 * 3600 * 1000).toISOString();
+  await sb.from("worker_sessions").insert({
+    worker_id: workerId,
+    token_hash: tokenHash,
+    expires_at: expiresAt,
+    last_seen_at: new Date().toISOString(),
+  });
+  return `homigo_worker_session=${encodeURIComponent(token)}`;
+}
+
+async function verifyOtpWorkerApi(bookingId, otp, sessionCookie, { retry = true } = {}) {
+  let last = { res: null, json: {}, ok: false };
+  const attempts = retry ? 5 : 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const res = await fetch(`${baseUrl}/api/worker/bookings/${bookingId}/verify-completion-otp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: sessionCookie,
+      },
+      body: JSON.stringify({ otp }),
+    });
+    const json = await res.json().catch(() => ({}));
+    last = { res, json, ok: res.ok && json.ok };
+    if (last.ok) return last;
+    if (res.status >= 400 && res.status < 500) return last;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return last;
+}
+
+async function confirmCashWorkerApi(bookingId, sessionCookie) {
+  const res = await fetch(`${baseUrl}/api/worker/bookings/${bookingId}/confirm-cash`, {
+    method: "POST",
+    headers: { Cookie: sessionCookie },
+  });
+  const json = await res.json().catch(() => ({}));
+  return { res, json, ok: res.ok && json.ok };
 }
 
 async function run() {
@@ -384,6 +450,7 @@ async function run() {
   );
 
   const devOtp = otpJson.dev_otp ?? convOtp?.context?.dev_completion_otp;
+  const workerSession = await createWorkerSession(scenario.worker.id);
 
   // K prep — payment menu NOT before OTP
   const prePay = await postWebhook(scenario.mobile, "1");
@@ -398,8 +465,21 @@ async function run() {
     `mode=${bookingPrePay?.Payment_mode ?? "null"}`,
   );
 
-  // F — correct OTP verifies
-  const verifyRes = await postWebhook(scenario.mobile, devOtp);
+  // F0 — customer OTP entry must NOT verify
+  const customerOtpTry = await postWebhook(scenario.mobile, devOtp);
+  const { data: bookingAfterCustomerOtp } = await sb
+    .from("booking")
+    .select("otp_verified")
+    .eq("id", scenario.bookingId)
+    .maybeSingle();
+  log(
+    "F0. Customer OTP entry does not verify",
+    customerOtpTry.res.ok && bookingAfterCustomerOtp?.otp_verified !== true,
+    `verified=${bookingAfterCustomerOtp?.otp_verified}`,
+  );
+
+  // F — worker verifies OTP via authenticated API
+  const verifyRes = await verifyOtpWorkerApi(scenario.bookingId, devOtp, workerSession);
   const { data: bookingVerified } = await sb
     .from("booking")
     .select("otp_verified, otp_verified_at, Payment_mode")
@@ -408,21 +488,32 @@ async function run() {
   const { data: convVerified } = await sb
     .from("whatsapp_conversations")
     .select("state, context")
-    .eq("whatsapp_mobile", scenario.mobile)
+    .eq("customer_id", scenario.customer.id)
+    .order("updated_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
   log(
-    "F. Correct OTP verifies",
-    verifyRes.res.ok &&
+    "F. Worker verifies OTP via authenticated API",
+    verifyRes.ok &&
       bookingVerified?.otp_verified === true &&
       convVerified?.context?.phase === "payment_selection",
-    `verified=${bookingVerified?.otp_verified}`,
+    `verified=${bookingVerified?.otp_verified} phase=${convVerified?.context?.phase ?? "none"} api=${verifyRes.json?.error ?? "ok"}`,
   );
 
-  // L — cash selection
+  // L — cash selection (after worker OTP verified)
+  for (let i = 0; i < 10; i++) {
+    const { data: ready } = await sb
+      .from("booking")
+      .select("otp_verified")
+      .eq("id", scenario.bookingId)
+      .maybeSingle();
+    if (ready?.otp_verified) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
   const cashRes = await postWebhook(scenario.mobile, "1");
   const { data: bookingCash } = await sb
     .from("booking")
-    .select("Payment_mode, payment_status, payment_received_at")
+    .select("Payment_mode, payment_status, payment_received_at, final_amount")
     .eq("id", scenario.bookingId)
     .maybeSingle();
   const { data: convCash } = await sb
@@ -431,14 +522,31 @@ async function run() {
     .eq("whatsapp_mobile", scenario.mobile)
     .maybeSingle();
   log(
-    "L. Cash selection stores Payment_mode=cash",
+    "L. Cash selection stores Payment_mode=cash and final_amount=1000",
     cashRes.res.ok &&
       bookingCash?.Payment_mode === "cash" &&
-      convCash?.state === "payment_pending",
-    `mode=${bookingCash?.Payment_mode}`,
+      convCash?.state === "payment_pending" &&
+      Number(bookingCash?.final_amount) === 1000,
+    `mode=${bookingCash?.Payment_mode} amount=${bookingCash?.final_amount}`,
   );
   log("N. Payment remains pending", bookingCash?.payment_status === "pending", bookingCash?.payment_status);
   log("O. payment_received_at remains null", bookingCash?.payment_received_at == null, "null");
+
+  // L2 — worker confirms cash → booking completed
+  const cashConfirm = await confirmCashWorkerApi(scenario.bookingId, workerSession);
+  const { data: bookingCashDone } = await sb
+    .from("booking")
+    .select("payment_status, booking_status, payment_received_at, final_amount")
+    .eq("id", scenario.bookingId)
+    .maybeSingle();
+  log(
+    "L2. Worker cash confirm completes booking (₹1000)",
+    cashConfirm.ok &&
+      bookingCashDone?.payment_status === "completed" &&
+      bookingCashDone?.booking_status === "completed" &&
+      Number(bookingCashDone?.final_amount) === 1000,
+    `status=${bookingCashDone?.payment_status}`,
+  );
 
   // Q — duplicate payment selection safe
   const dupPayMsg = `wamid.p5.duppay.${Date.now()}`;
@@ -457,10 +565,11 @@ async function run() {
 
   await cleanupScenario(scenario.sr.id, scenario.customer.id, scenario.mobile, scenario.worker.id);
 
-  // G — wrong OTP increments attempts
+  // G — wrong OTP increments attempts (worker API)
   const wrongScenario = await setupConfirmedBooking("en");
   await requestOtp(wrongScenario.bookingId, wrongScenario.worker.id);
-  await postWebhook(wrongScenario.mobile, "000000");
+  const wrongSession = await createWorkerSession(wrongScenario.worker.id);
+  await verifyOtpWorkerApi(wrongScenario.bookingId, "000000", wrongSession, { retry: false });
   const { data: bookingWrong } = await sb
     .from("booking")
     .select("otp_attempts, otp_verified")
@@ -478,16 +587,21 @@ async function run() {
     wrongScenario.worker.id,
   );
 
-  // H — expired OTP rejected
+  // H — expired OTP rejected (worker API)
   const expScenario = await setupConfirmedBooking("en");
   const expOtpRes = await requestOtp(expScenario.bookingId, expScenario.worker.id);
   const expOtpJson = expOtpRes.json;
+  const expSession = await createWorkerSession(expScenario.worker.id);
   const past = new Date(Date.now() - 60_000).toISOString();
   await sb
     .from("booking")
     .update({ otp_expires_at: past })
     .eq("id", expScenario.bookingId);
-  const expVerify = await postWebhook(expScenario.mobile, expOtpJson.dev_otp);
+  const expVerify = await verifyOtpWorkerApi(
+    expScenario.bookingId,
+    expOtpJson.dev_otp,
+    expSession,
+  );
   const { data: bookingExp } = await sb
     .from("booking")
     .select("otp_verified")
@@ -495,7 +609,7 @@ async function run() {
     .maybeSingle();
   log(
     "H. Expired OTP rejected",
-    expVerify.res.ok && bookingExp?.otp_verified !== true,
+    !expVerify.ok && bookingExp?.otp_verified !== true,
     `verified=${bookingExp?.otp_verified}`,
   );
   await cleanupScenario(
@@ -505,23 +619,26 @@ async function run() {
     expScenario.worker.id,
   );
 
-  // I — attempt limit enforced
+  // I — attempt limit enforced (worker API)
   const limitScenario = await setupConfirmedBooking("en");
   await requestOtp(limitScenario.bookingId, limitScenario.worker.id);
+  const limitSession = await createWorkerSession(limitScenario.worker.id);
   for (let i = 0; i < 5; i++) {
-    await postWebhook(limitScenario.mobile, "111111");
+    await verifyOtpWorkerApi(limitScenario.bookingId, "111111", limitSession, { retry: false });
   }
   const { data: bookingLimit } = await sb
     .from("booking")
     .select("otp_attempts, otp_verified")
     .eq("id", limitScenario.bookingId)
     .maybeSingle();
-  const limitVerify = await postWebhook(limitScenario.mobile, "222222");
+  const limitVerify = await verifyOtpWorkerApi(limitScenario.bookingId, "222222", limitSession, {
+    retry: false,
+  });
   log(
     "I. Attempt limit enforced",
     bookingLimit?.otp_attempts >= 5 &&
       bookingLimit?.otp_verified !== true &&
-      limitVerify.res.ok,
+      !limitVerify.ok,
     `attempts=${bookingLimit?.otp_attempts}`,
   );
   await cleanupScenario(
@@ -531,21 +648,28 @@ async function run() {
     limitScenario.worker.id,
   );
 
-  // J — duplicate OTP webhook idempotent
+  // J — duplicate worker verify is idempotent
   const idemScenario = await setupConfirmedBooking("en");
   const idemOtp = await requestOtp(idemScenario.bookingId, idemScenario.worker.id);
   const idemOtpJson = idemOtp.json;
-  const dupOtpMsg = `wamid.p5.dupotp.${Date.now()}`;
-  await postWebhook(idemScenario.mobile, idemOtpJson.dev_otp, dupOtpMsg);
-  await postWebhook(idemScenario.mobile, idemOtpJson.dev_otp, dupOtpMsg);
+  const idemSession = await createWorkerSession(idemScenario.worker.id);
+  await verifyOtpWorkerApi(idemScenario.bookingId, idemOtpJson.dev_otp, idemSession);
+  const idemAgain = await verifyOtpWorkerApi(
+    idemScenario.bookingId,
+    idemOtpJson.dev_otp,
+    idemSession,
+  );
   const { data: bookingIdem } = await sb
     .from("booking")
     .select("otp_verified, otp_attempts")
     .eq("id", idemScenario.bookingId)
     .maybeSingle();
   log(
-    "J. Duplicate OTP webhook is idempotent",
-    bookingIdem?.otp_verified === true && (bookingIdem?.otp_attempts ?? 0) === 0,
+    "J. Duplicate worker OTP verify is idempotent",
+    idemAgain.ok &&
+      idemAgain.json.already_verified === true &&
+      bookingIdem?.otp_verified === true &&
+      (bookingIdem?.otp_attempts ?? 0) === 0,
     `verified=${bookingIdem?.otp_verified}`,
   );
   await cleanupScenario(
@@ -555,39 +679,63 @@ async function run() {
     idemScenario.worker.id,
   );
 
-  // M — card selection
-  const cardScenario = await setupConfirmedBooking("en");
-  const cardOtp = await requestOtp(cardScenario.bookingId, cardScenario.worker.id);
-  const cardOtpJson = cardOtp.json;
-  await postWebhook(cardScenario.mobile, cardOtpJson.dev_otp);
-  await postWebhook(cardScenario.mobile, "2");
-  const { data: bookingCard } = await sb
+  // M — UPI selection + mock payment completes booking
+  const upiScenario = await setupConfirmedBooking("en");
+  const upiOtp = await requestOtp(upiScenario.bookingId, upiScenario.worker.id);
+  const upiOtpJson = upiOtp.json;
+  const upiSession = await createWorkerSession(upiScenario.worker.id);
+  await verifyOtpWorkerApi(upiScenario.bookingId, upiOtpJson.dev_otp, upiSession);
+  await postWebhook(upiScenario.mobile, "2");
+  const { data: bookingUpi } = await sb
     .from("booking")
-    .select("Payment_mode, payment_status, payment_received_at")
-    .eq("id", cardScenario.bookingId)
+    .select("Payment_mode, payment_status, payment_received_at, final_amount, otp_verified")
+    .eq("id", upiScenario.bookingId)
     .maybeSingle();
   log(
-    "M. Card selection stores Payment_mode=card",
-    bookingCard?.Payment_mode === "card" && bookingCard?.payment_status === "pending",
-    `mode=${bookingCard?.Payment_mode}`,
+    "M. UPI selection stores Payment_mode=upi and final_amount=990",
+    bookingUpi?.Payment_mode === "upi" &&
+      bookingUpi?.payment_status === "pending" &&
+      bookingUpi?.otp_verified === true &&
+      Number(bookingUpi?.final_amount) === 990,
+    `mode=${bookingUpi?.Payment_mode} amount=${bookingUpi?.final_amount}`,
   );
   log(
-    "O2. payment_received_at null for card",
-    bookingCard?.payment_received_at == null,
+    "O2. payment_received_at null for UPI before webhook",
+    bookingUpi?.payment_received_at == null,
     "null",
   );
+
+  const upiPay = await fetch(
+    `${baseUrl}/api/payments/razorpay/mock-pay?ref=${encodeURIComponent(upiScenario.bookingId)}`,
+  );
+  const upiPayJson = await upiPay.json().catch(() => ({}));
+  const { data: bookingUpiDone } = await sb
+    .from("booking")
+    .select("payment_status, booking_status, final_amount")
+    .eq("id", upiScenario.bookingId)
+    .maybeSingle();
+  log(
+    "M2. UPI mock payment completes booking (₹990)",
+    upiPay.ok &&
+      upiPayJson.ok &&
+      bookingUpiDone?.payment_status === "completed" &&
+      bookingUpiDone?.booking_status === "completed" &&
+      Number(bookingUpiDone?.final_amount) === 990,
+    `status=${bookingUpiDone?.payment_status} err=${upiPayJson.error ?? "none"}`,
+  );
   await cleanupScenario(
-    cardScenario.sr.id,
-    cardScenario.customer.id,
-    cardScenario.mobile,
-    cardScenario.worker.id,
+    upiScenario.sr.id,
+    upiScenario.customer.id,
+    upiScenario.mobile,
+    upiScenario.worker.id,
   );
 
   // P — invalid payment option
   const invScenario = await setupConfirmedBooking("en");
   const invOtp = await requestOtp(invScenario.bookingId, invScenario.worker.id);
   const invOtpJson = invOtp.json;
-  await postWebhook(invScenario.mobile, invOtpJson.dev_otp);
+  const invSession = await createWorkerSession(invScenario.worker.id);
+  await verifyOtpWorkerApi(invScenario.bookingId, invOtpJson.dev_otp, invSession);
   await postWebhook(invScenario.mobile, "9");
   const { data: bookingInv } = await sb
     .from("booking")
@@ -611,12 +759,13 @@ async function run() {
     invScenario.worker.id,
   );
 
-  // R — already verified OTP safe
+  // R — already verified OTP safe (worker re-verify)
   const reScenario = await setupConfirmedBooking("en");
   const reOtp = await requestOtp(reScenario.bookingId, reScenario.worker.id);
   const reOtpJson = reOtp.json;
-  await postWebhook(reScenario.mobile, reOtpJson.dev_otp);
-  await postWebhook(reScenario.mobile, "999999");
+  const reSession = await createWorkerSession(reScenario.worker.id);
+  await verifyOtpWorkerApi(reScenario.bookingId, reOtpJson.dev_otp, reSession);
+  await verifyOtpWorkerApi(reScenario.bookingId, "999999", reSession, { retry: false });
   const { data: bookingRe } = await sb
     .from("booking")
     .select("otp_verified, otp_attempts")
@@ -626,6 +775,29 @@ async function run() {
     "R. Already verified OTP handled safely",
     bookingRe?.otp_verified === true && (bookingRe?.otp_attempts ?? 0) === 0,
     `attempts=${bookingRe?.otp_attempts}`,
+  );
+
+  // B2 — wrong worker cannot verify OTP
+  const forbidScenario = await setupConfirmedBooking("en");
+  await requestOtp(forbidScenario.bookingId, forbidScenario.worker.id);
+  const forbidOtpJson = (await requestOtp(forbidScenario.bookingId, forbidScenario.worker.id)).json;
+  const otherWorker = await findOtherWorker(forbidScenario.worker.id, forbidScenario.service.id);
+  const otherSession = await createWorkerSession(otherWorker.id);
+  const forbidVerify = await verifyOtpWorkerApi(
+    forbidScenario.bookingId,
+    forbidOtpJson.dev_otp ?? "123456",
+    otherSession,
+  );
+  log(
+    "B2. Wrong worker cannot verify OTP",
+    forbidVerify.res.status === 403 || forbidVerify.json.error === "forbidden",
+    forbidVerify.json.error,
+  );
+  await cleanupScenario(
+    forbidScenario.sr.id,
+    forbidScenario.customer.id,
+    forbidScenario.mobile,
+    forbidScenario.worker.id,
   );
   await cleanupScenario(
     reScenario.sr.id,

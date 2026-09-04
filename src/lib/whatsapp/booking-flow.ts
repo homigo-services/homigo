@@ -10,49 +10,65 @@ import {
 } from "@/lib/service-requests/queries";
 import { sendWhatsAppText } from "./client";
 import {
+  buildAddressConfirmationContext,
+  buildAwaitingCustomDateContext,
+  buildDateSelectionContext,
+  buildDetailsCollectionContext,
+  buildRateRejectContext,
+  buildServiceMenuContext,
+  buildServiceSelectedContext,
+  buildSlotSelectionContext,
+  hasValidBookingServiceContext,
+} from "./context-builders";
+import {
   COLLECT_ADDRESS,
   COLLECT_AREA,
   COLLECT_PINCODE,
+  CUSTOM_DATE_INSTRUCTION,
   dateSelectionPrompt,
   GENERIC_ERROR,
+  INVALID_ADDRESS_CONFIRM_REPLY,
   INVALID_DATE,
   INVALID_PINCODE,
   INVALID_RATE_CARD_REPLY,
   INVALID_SERVICE_SELECTION,
   INVALID_SLOT,
   languageConfirmationWithMenu,
+  returningCustomerGreetingWithMenu,
   PRICING_UNAVAILABLE,
   rateCardQuoteMessage,
   RATE_CARD_ACCEPTED,
   RATE_CARD_REJECTED,
-  returningCustomerGreetingWithMenu,
+  savedAddressConfirmationMessage,
   slotSelectionPrompt,
   WORKER_MATCHING_PENDING,
 } from "./booking-messages";
 import {
   type ConversationContext,
-  readyLanguageContext,
+  refreshConversation,
   updateConversation,
 } from "./conversation";
-import { isGreeting } from "./parser";
+import { waContextSnapshot, waDebug } from "./debug-log";
 import {
   loadServiceMenu,
   resolveServiceFromMenu,
   type ServiceMenuEntry,
 } from "./service-menu";
 import {
+  isCustomDateMenuChoice,
   isPastDate,
-  parseCustomerDateInput,
+  parseBookingDateSelection,
   parseSlotSelection,
-  todayIso,
-  tomorrowIso,
 } from "./slots";
 import type { WhatsappConversation, WhatsappConversationState } from "./types";
 import type { HandleMessageResult } from "./handler";
 import { getBatchStatus } from "@/lib/workers/matching";
-import { startWorkerMatchingBatch1 } from "@/lib/workers/offers";
-import { WORKER_MATCHING_STARTED } from "./booking-messages";
-import { LANGUAGE_CONFIRMATION } from "./messages";
+import { startWorkerMatchingWithNotifications } from "@/lib/workers/batch-matching";
+import { WORKER_NOT_FOUND_CUSTOMER } from "@/lib/workers/worker-messages";
+import { LANGUAGE_CONFIRMATION, ONBOARDING_WELCOME_WITH_LANGUAGE } from "./messages";
+import { buildFreshOnboardingContext } from "./context-builders";
+import { resetConversationForNewBooking } from "./conversation";
+import { isGreeting } from "./parser";
 
 type Lang = "en" | "mr" | "hi";
 type CollectingField = "area" | "pincode" | "address_line";
@@ -84,36 +100,15 @@ function ctxOf(conversation: WhatsappConversation): ConversationContext {
   return conversation.context as ConversationContext;
 }
 
-async function resolveBookingServiceId(
-  supabase: SupabaseClient,
-  ctx: ConversationContext,
-): Promise<string | undefined> {
-  if (ctx.service_id) return String(ctx.service_id);
-  if (!ctx.rate_card_id) return undefined;
-
-  const card = await getRateCardById(supabase, String(ctx.rate_card_id));
-  return card.data?.service_id;
-}
-
-function menuFromContext(ctx: ConversationContext): ServiceMenuEntry[] {
-  const raw = ctx.service_menu;
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(
-    (e): e is ServiceMenuEntry =>
-      typeof e === "object" &&
-      e !== null &&
-      typeof (e as ServiceMenuEntry).id === "string" &&
-      typeof (e as ServiceMenuEntry).index === "number",
-  );
+function isPendingValue(value: string | null | undefined): boolean {
+  return !value?.trim() || value.trim() === "pending";
 }
 
 function getMissingFields(customer: Customer): CollectingField[] {
   const missing: CollectingField[] = [];
-  if (!customer.area?.trim() || customer.area === "pending") missing.push("area");
-  if (!customer.pincode?.trim() || customer.pincode === "pending")
-    missing.push("pincode");
-  if (!customer.address_line?.trim() || customer.address_line === "pending")
-    missing.push("address_line");
+  if (isPendingValue(customer.area)) missing.push("area");
+  if (isPendingValue(customer.pincode)) missing.push("pincode");
+  if (isPendingValue(customer.address_line)) missing.push("address_line");
   return missing;
 }
 
@@ -125,6 +120,20 @@ function promptForField(field: CollectingField, lang: Lang): string {
   if (field === "area") return COLLECT_AREA[lang];
   if (field === "pincode") return COLLECT_PINCODE[lang];
   return COLLECT_ADDRESS[lang];
+}
+
+function inferCollectingField(
+  state: WhatsappConversationState,
+  customer: Customer,
+  ctx: ConversationContext,
+): CollectingField | undefined {
+  if (ctx.collecting_field) return ctx.collecting_field as CollectingField;
+  if (state === "pincode_collection") return "pincode";
+  if (state === "address_collection") {
+    const missing = getMissingFields(customer);
+    return missing[0];
+  }
+  return undefined;
 }
 
 async function refreshCustomer(
@@ -161,53 +170,147 @@ async function patchConversation(
   return result.data;
 }
 
-async function sendMenuAndPersist(
+async function resolveBookingServiceId(
+  supabase: SupabaseClient,
+  ctx: ConversationContext,
+): Promise<string | undefined> {
+  if (ctx.service_id) return String(ctx.service_id);
+  if (!ctx.rate_card_id) return undefined;
+  const card = await getRateCardById(supabase, String(ctx.rate_card_id));
+  return card.data?.service_id;
+}
+
+function menuFromContext(ctx: ConversationContext): ServiceMenuEntry[] {
+  const raw = ctx.service_menu;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (e): e is ServiceMenuEntry =>
+      typeof e === "object" &&
+      e !== null &&
+      typeof (e as ServiceMenuEntry).id === "string" &&
+      typeof (e as ServiceMenuEntry).index === "number",
+  );
+}
+
+async function recoverToLanguageOnboarding(
   input: BookingFlowInput,
-  prefix = "",
+  reason: string,
 ): Promise<HandleMessageResult> {
-  const { supabase, conversation, messageId, lang, customer } = input;
-  const ctx = ctxOf(conversation);
-
-  const menuResult = await loadServiceMenu(supabase, lang);
-  if (menuResult.error) {
-    console.error("[whatsapp] service catalog failed:", menuResult.error);
-    const send = await sendWhatsAppText(customer.mobile, GENERIC_ERROR[lang]);
-    return { handled: true, replied: send.ok, error: menuResult.error };
-  }
-
-  const body = prefix ? `${prefix}${menuResult.body}` : menuResult.body;
-  const send = await sendWhatsAppText(customer.mobile, body);
-
-  await patchConversation(supabase, conversation, {
-    state: "service_selection",
-    last_message_id: messageId,
-    last_message_at: new Date().toISOString(),
-    context: {
-      ...ctx,
-      phase: "ready",
-      service_menu: menuResult.menu,
-    },
+  waDebug("BRANCH", {
+    messageId: input.messageId,
+    mobile: input.customer.mobile,
+    branch: "recover_to_language_onboarding",
+    error: reason,
   });
 
+  await resetConversationForNewBooking(
+    input.supabase,
+    input.conversation,
+    input.messageId,
+  );
+  await patchConversation(input.supabase, input.conversation, {
+    context: buildFreshOnboardingContext({ whatsapp_onboarding_started: true }),
+  });
+  const send = await sendWhatsAppText(
+    input.customer.mobile,
+    ONBOARDING_WELCOME_WITH_LANGUAGE,
+  );
   return { handled: true, replied: send.ok };
 }
 
-async function beginDetailsCollection(
+async function recoverToServiceSelection(
+  input: BookingFlowInput,
+  reason: string,
+): Promise<HandleMessageResult> {
+  waDebug("BRANCH", {
+    messageId: input.messageId,
+    mobile: input.customer.mobile,
+    branch: "recover_to_service_selection",
+    error: reason,
+  });
+
+  const menuResult = await loadServiceMenu(input.supabase, input.lang);
+  if (menuResult.error) {
+    const send = await sendWhatsAppText(input.customer.mobile, GENERIC_ERROR[input.lang]);
+    return { handled: true, replied: send.ok, error: menuResult.error };
+  }
+
+  const send = await sendWhatsAppText(input.customer.mobile, menuResult.body);
+  const ctx = ctxOf(input.conversation);
+  await patchConversation(input.supabase, input.conversation, {
+    state: "service_selection",
+    service_request_id: null,
+    booking_id: null,
+    last_message_id: input.messageId,
+    last_message_at: new Date().toISOString(),
+    context: buildServiceMenuContext(
+      input.lang,
+      menuResult.menu,
+      ctx.whatsapp_onboarding_started,
+    ),
+  });
+  return { handled: true, replied: send.ok };
+}
+
+async function enterDateSelection(
+  input: BookingFlowInput,
+  ctx: ConversationContext,
+): Promise<HandleMessageResult> {
+  if (!hasValidBookingServiceContext(ctx)) {
+    return recoverToServiceSelection(input, "missing_service_context_for_date");
+  }
+
+  const freshCustomer =
+    (await refreshCustomer(input.supabase, input.customer.id)) ?? input.customer;
+  if (getMissingFields(freshCustomer).length > 0) {
+    return beginProfileCollectionAfterService(input, freshCustomer, ctx);
+  }
+
+  const send = await sendWhatsAppText(
+    input.customer.mobile,
+    dateSelectionPrompt(input.lang),
+  );
+  await patchConversation(input.supabase, input.conversation, {
+    state: "date_selection",
+    last_message_id: input.messageId,
+    last_message_at: new Date().toISOString(),
+    context: buildDateSelectionContext(ctx),
+  });
+  return { handled: true, replied: send.ok };
+}
+
+async function beginProfileCollectionAfterService(
   input: BookingFlowInput,
   customer: Customer,
   ctx: ConversationContext,
+  source: "service_selection" | "field_saved" = "service_selection",
 ): Promise<HandleMessageResult> {
+  if (!hasValidBookingServiceContext(ctx)) {
+    return recoverToServiceSelection(input, "missing_service_context_after_select");
+  }
+
   const missing = getMissingFields(customer);
   if (missing.length === 0) {
-    const send = await sendWhatsAppText(
-      input.customer.mobile,
-      dateSelectionPrompt(input.lang),
-    );
+    if (source === "field_saved") {
+      return enterDateSelection(input, ctx);
+    }
+
+    const body = savedAddressConfirmationMessage(input.lang, {
+      area: customer.area,
+      pincode: customer.pincode,
+      addressLine: customer.address_line,
+    });
+    const send = await sendWhatsAppText(input.customer.mobile, body);
     await patchConversation(input.supabase, input.conversation, {
-      state: "date_selection",
+      state: "address_collection",
       last_message_id: input.messageId,
       last_message_at: new Date().toISOString(),
-      context: { ...ctx, collecting_field: undefined },
+      context: buildAddressConfirmationContext({
+        base: ctx,
+        area: customer.area,
+        pincode: customer.pincode,
+        addressLine: customer.address_line,
+      }),
     });
     return { handled: true, replied: send.ok };
   }
@@ -221,8 +324,37 @@ async function beginDetailsCollection(
     state: stateForField(field),
     last_message_id: input.messageId,
     last_message_at: new Date().toISOString(),
-    context: { ...ctx, collecting_field: field },
+    context: buildDetailsCollectionContext({ base: ctx, collectingField: field }),
   });
+  return { handled: true, replied: send.ok };
+}
+
+async function handleSavedAddressConfirmation(
+  input: BookingFlowInput,
+  ctx: ConversationContext,
+): Promise<HandleMessageResult> {
+  const choice = input.text.trim();
+  if (choice === "1") {
+    return enterDateSelection(input, ctx);
+  }
+  if (choice === "2") {
+    const send = await sendWhatsAppText(
+      input.customer.mobile,
+      promptForField("area", input.lang),
+    );
+    await patchConversation(input.supabase, input.conversation, {
+      state: "address_collection",
+      last_message_id: input.messageId,
+      last_message_at: new Date().toISOString(),
+      context: buildDetailsCollectionContext({ base: ctx, collectingField: "area" }),
+    });
+    return { handled: true, replied: send.ok };
+  }
+
+  const send = await sendWhatsAppText(
+    input.customer.mobile,
+    INVALID_ADDRESS_CONFIRM_REPLY[input.lang],
+  );
   return { handled: true, replied: send.ok };
 }
 
@@ -231,34 +363,28 @@ async function handleServiceSelection(
 ): Promise<HandleMessageResult> {
   const { supabase, conversation, text, messageId, lang, customer } = input;
   const ctx = ctxOf(conversation);
-  let menu = menuFromContext(ctx);
+  const menu = menuFromContext(ctx);
 
-  if (menu.length === 0 || isGreeting(text)) {
-    if (isGreeting(text)) {
-      const menuResult = await loadServiceMenu(supabase, lang);
-      if (menuResult.error) {
-        console.error("[whatsapp] service catalog failed:", menuResult.error);
-        const send = await sendWhatsAppText(customer.mobile, GENERIC_ERROR[lang]);
-        return { handled: true, replied: send.ok, error: menuResult.error };
-      }
-      const body = returningCustomerGreetingWithMenu(lang, menuResult.body);
-      const send = await sendWhatsAppText(customer.mobile, body);
-      await patchConversation(supabase, conversation, {
-        state: "service_selection",
-        last_message_id: messageId,
-        last_message_at: new Date().toISOString(),
-        context: { ...ctx, phase: "ready", service_menu: menuResult.menu },
-      });
-      return { handled: true, replied: send.ok };
+  if (menu.length === 0) {
+    const menuResult = await loadServiceMenu(supabase, lang);
+    if (menuResult.error) {
+      const send = await sendWhatsAppText(customer.mobile, GENERIC_ERROR[lang]);
+      return { handled: true, replied: send.ok, error: menuResult.error };
     }
-    return sendMenuAndPersist(input);
+    const send = await sendWhatsAppText(customer.mobile, menuResult.body);
+    await patchConversation(supabase, conversation, {
+      state: "service_selection",
+      last_message_id: messageId,
+      last_message_at: new Date().toISOString(),
+      context: buildServiceMenuContext(lang, menuResult.menu, ctx.whatsapp_onboarding_started),
+    });
+    return { handled: true, replied: send.ok };
   }
 
   const selected = resolveServiceFromMenu(text, menu);
   if (!selected) {
     const menuResult = await loadServiceMenu(supabase, lang);
     if (menuResult.error) {
-      console.error("[whatsapp] service catalog failed:", menuResult.error);
       const send = await sendWhatsAppText(customer.mobile, GENERIC_ERROR[lang]);
       return { handled: true, replied: send.ok, error: menuResult.error };
     }
@@ -268,30 +394,30 @@ async function handleServiceSelection(
       state: "service_selection",
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
-      context: { ...ctx, phase: "ready", service_menu: menuResult.menu },
+      context: buildServiceMenuContext(lang, menuResult.menu, ctx.whatsapp_onboarding_started),
     });
     return { handled: true, replied: send.ok };
   }
 
-  const updatedCtx: ConversationContext = {
-    ...ctx,
-    service_id: selected.id,
-    service_name: selected.name,
-    original_message: text,
-    phase: "booking",
-  };
+  const serviceCtx = buildServiceSelectedContext({
+    serviceId: selected.id,
+    serviceName: selected.name,
+    originalMessage: text,
+    languageConfirmedAt: ctx.language_confirmed_at,
+    whatsappOnboardingStarted: ctx.whatsapp_onboarding_started,
+  });
 
   const patched = await patchConversation(supabase, conversation, {
-    context: updatedCtx,
+    context: serviceCtx,
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
   });
 
   const freshCustomer = (await refreshCustomer(supabase, customer.id)) ?? customer;
-  return beginDetailsCollection(
+  return beginProfileCollectionAfterService(
     { ...input, conversation: patched ?? conversation },
     freshCustomer,
-    updatedCtx,
+    serviceCtx,
   );
 }
 
@@ -300,11 +426,16 @@ async function handleDetailsCollection(
 ): Promise<HandleMessageResult> {
   const { supabase, conversation, text, messageId, lang, customer } = input;
   const ctx = ctxOf(conversation);
-  const field = ctx.collecting_field as CollectingField | undefined;
+
+  if (ctx.phase === "confirm_saved_address") {
+    return handleSavedAddressConfirmation(input, ctx);
+  }
+
+  const freshCustomer = (await refreshCustomer(supabase, customer.id)) ?? customer;
+  const field = inferCollectingField(conversation.state, freshCustomer, ctx);
 
   if (!field) {
-    const fresh = (await refreshCustomer(supabase, customer.id)) ?? customer;
-    return beginDetailsCollection(input, fresh, ctx);
+    return beginProfileCollectionAfterService(input, freshCustomer, ctx);
   }
 
   const value = text.trim();
@@ -328,8 +459,8 @@ async function handleDetailsCollection(
     return { handled: true, replied: send.ok, error: saveError };
   }
 
-  const freshCustomer = (await refreshCustomer(supabase, customer.id)) ?? customer;
-  return beginDetailsCollection(input, freshCustomer, ctx);
+  const updatedCustomer = (await refreshCustomer(supabase, customer.id)) ?? freshCustomer;
+  return beginProfileCollectionAfterService(input, updatedCustomer, ctx, "field_saved");
 }
 
 async function handleDateSelection(
@@ -339,17 +470,63 @@ async function handleDateSelection(
   const ctx = ctxOf(conversation);
   const trimmed = text.trim();
 
-  let isoDate: string | null = null;
+  waDebug("DATE", {
+    messageId,
+    mobile: customer.mobile,
+    textPreview: trimmed,
+    state: conversation.state,
+    phase: String(ctx.phase ?? ""),
+    collecting_field: String(ctx.collecting_field ?? ""),
+    service_id: String(ctx.service_id ?? ""),
+    service_request_id: String(ctx.service_request_id ?? ""),
+    service_date: String(ctx.service_date ?? ""),
+  });
 
-  if (trimmed === "1") isoDate = todayIso();
-  else if (trimmed === "2") isoDate = tomorrowIso();
-  else isoDate = parseCustomerDateInput(trimmed);
+  if (!hasValidBookingServiceContext(ctx)) {
+    return recoverToServiceSelection(input, "invalid_date_selection_context");
+  }
 
-  if (!isoDate || isPastDate(isoDate)) {
-    const send = await sendWhatsAppText(
-      customer.mobile,
-      `${INVALID_DATE[lang]}\n\n${dateSelectionPrompt(lang)}`,
-    );
+  if (isGreeting(trimmed)) {
+    return recoverToLanguageOnboarding(input, "greeting_at_date_selection");
+  }
+
+  if (!ctx.awaiting_custom_date && isCustomDateMenuChoice(trimmed)) {
+    const send = await sendWhatsAppText(customer.mobile, CUSTOM_DATE_INSTRUCTION[lang]);
+    await patchConversation(supabase, conversation, {
+      state: "date_selection",
+      last_message_id: messageId,
+      last_message_at: new Date().toISOString(),
+      context: buildAwaitingCustomDateContext(ctx),
+    });
+    return { handled: true, replied: send.ok };
+  }
+
+  const isoDate = parseBookingDateSelection(trimmed);
+
+  waDebug("DATE", {
+    messageId,
+    mobile: customer.mobile,
+    textPreview: trimmed,
+    state: conversation.state,
+    phase: String(ctx.phase ?? ""),
+    collecting_field: String(ctx.collecting_field ?? ""),
+    service_id: String(ctx.service_id ?? ""),
+    parsed_date: isoDate ?? "null",
+    is_past: isoDate ? isPastDate(isoDate) : true,
+  });
+
+  if (!isoDate) {
+    const looksLikeDate = /^\d{1,2}[-/]\d{1,2}[-/]\d{4}$/.test(trimmed);
+    const body = looksLikeDate
+      ? `${INVALID_DATE[lang]}\n\n${dateSelectionPrompt(lang)}`
+      : `${INVALID_DATE[lang]}\n\n${dateSelectionPrompt(lang)}`;
+    const send = await sendWhatsAppText(customer.mobile, body);
+    await patchConversation(supabase, conversation, {
+      state: "date_selection",
+      last_message_id: messageId,
+      last_message_at: new Date().toISOString(),
+      context: buildDateSelectionContext(ctx),
+    });
     return { handled: true, replied: send.ok };
   }
 
@@ -358,7 +535,7 @@ async function handleDateSelection(
     state: "slot_selection",
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
-    context: { ...ctx, service_date: isoDate },
+    context: buildSlotSelectionContext(ctx, isoDate),
   });
   return { handled: true, replied: send.ok };
 }
@@ -368,6 +545,14 @@ async function handleSlotSelection(
 ): Promise<HandleMessageResult> {
   const { supabase, conversation, text, messageId, lang, customer } = input;
   const ctx = ctxOf(conversation);
+
+  if (!hasValidBookingServiceContext(ctx)) {
+    return recoverToServiceSelection(input, "invalid_slot_selection_context");
+  }
+
+  if (isGreeting(text.trim())) {
+    return recoverToLanguageOnboarding(input, "greeting_at_slot_selection");
+  }
 
   const slot = parseSlotSelection(text);
   if (!slot) {
@@ -382,9 +567,8 @@ async function handleSlotSelection(
   const serviceName = String(ctx.service_name ?? "Service");
   const serviceDate = String(ctx.service_date ?? "");
 
-  if (!serviceId || !serviceDate) {
-    console.error("[whatsapp] missing service context for slot selection");
-    return sendMenuAndPersist(input);
+  if (!serviceDate) {
+    return enterDateSelection(input, ctx);
   }
 
   const freshCustomer = (await refreshCustomer(supabase, customer.id)) ?? customer;
@@ -419,6 +603,8 @@ async function handleSlotSelection(
   }
 
   if (!rateResult.card || !rateResult.amounts) {
+    const menuResult = await loadServiceMenu(supabase, lang);
+    const menu = menuResult.menu.length > 0 ? menuResult.menu : menuFromContext(ctx);
     const send = await sendWhatsAppText(customer.mobile, PRICING_UNAVAILABLE[lang]);
     await patchConversation(supabase, conversation, {
       state: "service_selection",
@@ -426,10 +612,12 @@ async function handleSlotSelection(
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
       context: {
-        ...ctx,
+        ...buildServiceMenuContext(lang, menu, ctx.whatsapp_onboarding_started),
         phase: "rate_unavailable",
         preferred_time_slot: slot.value,
-        service_request_id: srResult.data.id,
+        service_date: serviceDate,
+        service_id: serviceId,
+        service_name: serviceName,
       },
     });
     return { handled: true, replied: send.ok };
@@ -452,7 +640,7 @@ async function handleSlotSelection(
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
     context: {
-      ...ctx,
+      ...buildSlotSelectionContext(ctx, serviceDate),
       phase: "awaiting_rate_confirmation",
       preferred_time_slot: slot.value,
       service_request_id: srResult.data.id,
@@ -490,7 +678,7 @@ async function handleRateCardConfirmation(
 
       const serviceId = await resolveBookingServiceId(supabase, ctx);
 
-      const matching = await startWorkerMatchingBatch1(supabase, {
+      const matching = await startWorkerMatchingWithNotifications(supabase, {
         serviceRequestId,
         serviceId,
         serviceType: sr?.service_type ? String(sr.service_type) : undefined,
@@ -502,7 +690,11 @@ async function handleRateCardConfirmation(
         console.error("[whatsapp] worker matching failed:", matching.error);
       }
 
-      matchingMessage = WORKER_MATCHING_STARTED[lang](matching.batch.offerCount);
+      if (matching.noMoreWorkers || matching.batch.status === "no_workers") {
+        matchingMessage = WORKER_NOT_FOUND_CUSTOMER[lang];
+      } else {
+        matchingMessage = RATE_CARD_ACCEPTED[lang];
+      }
 
       await patchConversation(supabase, conversation, {
         state: "worker_assignment",
@@ -547,11 +739,7 @@ async function handleRateCardConfirmation(
       service_request_id: null,
       last_message_id: messageId,
       last_message_at: new Date().toISOString(),
-      context: {
-        phase: "ready",
-        whatsapp_onboarding_started: ctx.whatsapp_onboarding_started,
-        language_confirmed_at: ctx.language_confirmed_at,
-      },
+      context: buildRateRejectContext(ctx),
     });
     return { handled: true, replied: send.ok };
   }
@@ -569,29 +757,12 @@ async function handleWorkerAssignment(
     ctx.service_request_id ?? conversation.service_request_id ?? "",
   );
 
-  console.log("[whatsapp][worker_assignment] enter", {
-    conversationId: conversation.id,
-    mobile: customer.mobile,
-    text: input.text,
-    serviceRequestId: serviceRequestId || null,
-    contextServiceRequestId: ctx.service_request_id ?? null,
-    columnServiceRequestId: conversation.service_request_id ?? null,
-  });
-
   if (serviceRequestId) {
     const batch = await getBatchStatus(supabase, serviceRequestId, 1);
     const retryCondition =
       !batch.error &&
       batch.data.offerCount === 0 &&
       batch.data.status !== "accepted";
-
-    console.log("[whatsapp][worker_assignment] batch status", {
-      serviceRequestId,
-      offerCount: batch.data.offerCount,
-      batchStatus: batch.data.status,
-      batchError: batch.error,
-      retryCondition,
-    });
 
     if (retryCondition) {
       const { data: sr } = await supabase
@@ -602,29 +773,12 @@ async function handleWorkerAssignment(
 
       const serviceId = await resolveBookingServiceId(supabase, ctx);
 
-      console.log("[whatsapp][worker_assignment] calling startWorkerMatchingBatch1", {
-        serviceRequestId,
-        serviceId: serviceId ?? null,
-        serviceType: sr?.service_type ?? null,
-        area: sr?.area ?? customer.area,
-        pincode: sr?.pincode ?? customer.pincode,
-      });
-
-      const matching = await startWorkerMatchingBatch1(supabase, {
+      const matching = await startWorkerMatchingWithNotifications(supabase, {
         serviceRequestId,
         serviceId,
         serviceType: sr?.service_type ? String(sr.service_type) : undefined,
         area: sr?.area ? String(sr.area) : customer.area,
         pincode: sr?.pincode ? String(sr.pincode) : customer.pincode,
-      });
-
-      console.log("[whatsapp][worker_assignment] startWorkerMatchingBatch1 result", {
-        serviceRequestId,
-        offerCount: matching.batch.offerCount,
-        batchStatus: matching.batch.status,
-        error: matching.error,
-        serviceId: matching.serviceId,
-        offersCreated: matching.offers.length,
       });
 
       if (matching.error) {
@@ -649,13 +803,11 @@ async function handleWorkerAssignment(
         });
         const send = await sendWhatsAppText(
           customer.mobile,
-          WORKER_MATCHING_STARTED[lang](matching.batch.offerCount),
+          RATE_CARD_ACCEPTED[lang],
         );
         return { handled: true, replied: send.ok };
       }
     }
-  } else {
-    console.log("[whatsapp][worker_assignment] skip retry — no serviceRequestId");
   }
 
   const send = await sendWhatsAppText(customer.mobile, WORKER_MATCHING_PENDING[lang]);
@@ -666,7 +818,7 @@ async function handleWorkerAssignment(
   return { handled: true, replied: send.ok };
 }
 
-/** Phase 4A booking FSM — service selection through rate card confirmation. */
+/** Phase 4A booking FSM — service selection through worker assignment. */
 export async function handleBookingFlow(
   input: BookingFlowInput,
 ): Promise<HandleMessageResult> {
@@ -685,7 +837,10 @@ export async function handleBookingFlow(
     case "worker_assignment":
       return handleWorkerAssignment(input);
     default:
-      return handleServiceSelection(input);
+      return recoverToServiceSelection(
+        input,
+        `unknown_booking_state:${input.conversation.state}`,
+      );
   }
 }
 
@@ -713,12 +868,11 @@ export async function sendPostLanguageServiceMenu(
 
   await patchConversation(supabase, conversation, {
     state: "service_selection",
+    service_request_id: null,
+    booking_id: null,
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
-    context: {
-      ...readyLanguageContext(conversation.context as ConversationContext, lang),
-      service_menu: menuResult.menu,
-    },
+    context: buildServiceMenuContext(lang, menuResult.menu, true),
   });
 
   return { handled: true, replied: send.ok };
@@ -744,16 +898,33 @@ export async function sendReturningCustomerServiceMenu(
     : menuResult.body;
 
   const send = await sendWhatsAppText(customer.mobile, body);
+  const ctx = conversation.context as ConversationContext;
 
   await patchConversation(supabase, conversation, {
     state: "service_selection",
+    service_request_id: null,
+    booking_id: null,
     last_message_id: messageId,
     last_message_at: new Date().toISOString(),
-    context: {
-      ...readyLanguageContext(conversation.context as ConversationContext, lang),
-      service_menu: menuResult.menu,
-    },
+    context: buildServiceMenuContext(lang, menuResult.menu, ctx.whatsapp_onboarding_started),
   });
 
   return { handled: true, replied: send.ok };
+}
+
+export async function logConversationStateAfter(
+  supabase: SupabaseClient,
+  conversationId: string,
+  mobile: string,
+  messageId: string,
+): Promise<void> {
+  const refreshed = await refreshConversation(supabase, conversationId);
+  if (!refreshed.data) return;
+  const ctx = refreshed.data.context as ConversationContext;
+  waDebug("STATE-AFTER", {
+    messageId,
+    mobile,
+    stateAfter: refreshed.data.state,
+    contextSummary: waContextSnapshot(ctx),
+  });
 }

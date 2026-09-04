@@ -1,4 +1,5 @@
 import { devOnlyJsonResponse } from "@/lib/dev/guard";
+import { canExposeDevOtpInApi, isWhatsappMockSendEnabled } from "@/lib/env/runtime";
 import { createSupabaseServiceClient } from "@/lib/supabase-server";
 import { getServiceRequestMatchingSummary } from "@/lib/service-requests/matching-summary";
 import { fetchServiceCatalog } from "@/lib/workers/service-resolver";
@@ -140,7 +141,7 @@ export async function GET(request: Request) {
           verified: booking.otp_verified ?? false,
           verified_at: booking.otp_verified_at ?? null,
           dev_otp:
-            process.env.WHATSAPP_MOCK_SEND === "true"
+            canExposeDevOtpInApi() && isWhatsappMockSendEnabled()
               ? ((context?.dev_completion_otp as string | undefined) ?? null)
               : null,
         }

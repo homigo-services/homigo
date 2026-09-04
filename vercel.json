@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/expire-worker-offers",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}

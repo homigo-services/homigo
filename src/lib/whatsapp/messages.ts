@@ -3,13 +3,13 @@ import type { CustomerPreferredLanguage } from "@/lib/customers/types";
 export const HOMIGO_WELCOME = `Welcome to Homigo! 🏠
 घरच्या कामांसाठी trusted professional book करण्यासाठी आम्ही इथे आहोत.`;
 
-export const LANGUAGE_SELECTION_PROMPT = `कृपया तुमची language निवडा:
+export const LANGUAGE_SELECTION_PROMPT = `कृपया तुमची भाषा निवडा:
 
 1. मराठी
 2. हिंदी
 3. English
 
-Reply with 1, 2 or 3.`;
+कृपया 1, 2 किंवा 3 पाठवा.`;
 
 /** First onboarding reply: Homigo welcome + language menu. */
 export const ONBOARDING_WELCOME_WITH_LANGUAGE = `${HOMIGO_WELCOME}
@@ -58,7 +58,7 @@ export const READY_ACKNOWLEDGMENT: Record<CustomerPreferredLanguage, string> = {
 export const UNSUPPORTED_MESSAGE_TYPE =
   "Sorry, I can only read text messages right now. Please type your message.";
 
-export const INVALID_LANGUAGE_SELECTION = `कृपया language निवडा:
+export const INVALID_LANGUAGE_SELECTION = `कृपया भाषा निवडा:
 1 — मराठी
 2 — हिंदी
 3 — English`;

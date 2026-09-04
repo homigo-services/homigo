@@ -1,0 +1,18 @@
+{
+  "name": "Homigo Worker",
+  "short_name": "Homigo",
+  "description": "Homigo worker — manage service offers and bookings",
+  "start_url": "/worker/offers",
+  "display": "standalone",
+  "background_color": "#fafafa",
+  "theme_color": "#059669",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/file.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

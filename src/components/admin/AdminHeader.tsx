@@ -1,14 +1,17 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AdminIcon } from "@/components/admin/AdminIcon";
 import { cn } from "@/lib/cn";
+import { supabase } from "@/lib/supabase";
 
 interface AdminHeaderProps {
   onMenuClick: () => void;
 }
 
 export function AdminHeader({ onMenuClick }: AdminHeaderProps) {
+  const router = useRouter();
   const [profileOpen, setProfileOpen] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
 
@@ -25,6 +28,13 @@ export function AdminHeader({ onMenuClick }: AdminHeaderProps) {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
+
+  async function handleLogout() {
+    setProfileOpen(false);
+    await supabase.auth.signOut();
+    router.replace("/admin/login");
+    router.refresh();
+  }
 
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/95 backdrop-blur-md">
@@ -110,6 +120,7 @@ export function AdminHeader({ onMenuClick }: AdminHeaderProps) {
                 <hr className="my-1 border-slate-100" />
                 <button
                   type="button"
+                  onClick={handleLogout}
                   className="block min-h-11 w-full px-4 py-2.5 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
                 >
                   Logout

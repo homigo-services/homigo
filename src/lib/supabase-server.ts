@@ -1,7 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-let warnedAboutAnonFallback = false;
-
 export function createSupabaseServerClient(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -15,13 +13,16 @@ export function createSupabaseServerClient(): SupabaseClient {
     return createClient(url, serviceKey);
   }
 
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "Missing SUPABASE_SERVICE_ROLE_KEY — required for server API routes in production",
+    );
+  }
+
   if (anonKey) {
-    if (!warnedAboutAnonFallback && process.env.NODE_ENV === "production") {
-      warnedAboutAnonFallback = true;
-      console.warn(
-        "SUPABASE_SERVICE_ROLE_KEY is not set. Using anon key for server API routes.",
-      );
-    }
+    console.warn(
+      "SUPABASE_SERVICE_ROLE_KEY is not set. Using anon key for server API routes (dev only).",
+    );
     return createClient(url, anonKey);
   }
 

@@ -16,7 +16,7 @@ export function customerStateUsesNumericMenu(
   ctx: ConversationContext,
 ): boolean {
   if (NUMERIC_MENU_STATES.includes(state)) return true;
-  if (state === "service_completion" && ctx.phase === "payment_selection") {
+  if (state === "booking_confirmed" && ctx.phase === "payment_selection") {
     return true;
   }
   return false;

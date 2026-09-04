@@ -378,11 +378,9 @@ async function run() {
     `state=${conv?.state}`,
   );
 
-  const expectedAmount =
-    Number(rateCard?.base_amount ?? 500) + Number(rateCard?.lead_charge ?? 50);
   log(
     "G. Correct final_amount on booking",
-    Number(booking?.final_amount) === expectedAmount,
+    Number(booking?.final_amount) === 1000,
     `amount=${booking?.final_amount}`,
   );
 

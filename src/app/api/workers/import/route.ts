@@ -20,7 +20,11 @@ import {
 } from "@/lib/workers/queries";
 import type { GoogleFormWorkerPayload } from "@/lib/workers/types";
 
-export async function GET() {
+export async function GET(request: Request) {
+  if (!verifyWorkersImportSecret(request)) {
+    return unauthorizedImportResponse();
+  }
+
   try {
     const supabase = createSupabaseServerClient();
     const { data, error } = await fetchWorkersWithRelations(supabase);

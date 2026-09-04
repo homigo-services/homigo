@@ -2,7 +2,9 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchServiceCatalog } from "./service-resolver";
 import type { Worker } from "./types";
 
-export const MAX_MATCHED_WORKERS = 5;
+import { WORKER_BATCH_SIZE } from "@/lib/whatsapp/homigo-services";
+
+export const MAX_MATCHED_WORKERS = WORKER_BATCH_SIZE;
 export const OFFER_BATCH_TTL_MINUTES = 30;
 
 export type WorkerMatchRank = "pincode" | "area" | "other";
@@ -21,6 +23,7 @@ export interface MatchWorkersInput {
   serviceType?: string;
   area: string;
   pincode: string;
+  excludeWorkerIds?: string[];
 }
 
 function normalize(value: string | null | undefined): string {
@@ -132,7 +135,9 @@ export async function matchWorkersForServiceRequest(
     }
   };
 
-  const all = (workers ?? []) as Record<string, unknown>[];
+  const all = (workers ?? []).filter(
+    (w) => !input.excludeWorkerIds?.includes(String(w.id)),
+  ) as Record<string, unknown>[];
 
   addWorkers(
     all.filter((w) => normalize(String(w.pincode ?? "")) === targetPincode),

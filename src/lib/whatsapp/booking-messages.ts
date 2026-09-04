@@ -2,11 +2,16 @@ import type { CustomerPreferredLanguage } from "@/lib/customers/types";
 import type { CalculatedBookingAmounts } from "@/lib/rate-cards/calculator";
 import { formatCurrency } from "@/lib/bookings/helpers";
 import {
+  bookingDateOptions,
   formatDisplayDate,
-  TIME_SLOTS,
-  tomorrowIso,
-  todayIso,
+  formatIsoAsDdMmYyyy,
 } from "./slots";
+import {
+  homigoRateCardTitle,
+  HOMIGO_CASH_PAYMENT_AMOUNT,
+  HOMIGO_UPI_DISCOUNT,
+  HOMIGO_UPI_PAYMENT_AMOUNT,
+} from "./homigo-services";
 
 export const GENERIC_ERROR: Record<CustomerPreferredLanguage, string> = {
   en: "Sorry, something went wrong. Please try again in a moment.",
@@ -15,89 +20,169 @@ export const GENERIC_ERROR: Record<CustomerPreferredLanguage, string> = {
 };
 
 export const INVALID_SERVICE_SELECTION: Record<CustomerPreferredLanguage, string> = {
-  en: "Invalid selection. Reply with a number from the service list.",
-  mr: "चुकीची निवड. service list मधील number पाठवा.",
-  hi: "गलत चयन। service list में से number भेजें।",
+  en: "Invalid selection. Please reply with a number from the service list.",
+  mr: "चुकीची निवड. कृपया सेवा यादीतून क्रमांक निवडा.",
+  hi: "गलत चयन। कृपया सेवा सूची में से सही क्रमांक भेजें।",
 };
 
 export const COLLECT_AREA: Record<CustomerPreferredLanguage, string> = {
-  en: "Please share your area/locality:",
-  mr: "कृपया तुमचा area/locality पाठवा:",
-  hi: "कृपया अपना area/locality भेजें:",
+  en: "Please share your area or locality for this service:",
+  mr: "कृपया या सेवेसाठी तुमचा परिसर/भाग लिहा:",
+  hi: "कृपया इस सेवा के लिए अपना क्षेत्र/इलाका भेजें:",
 };
 
 export const COLLECT_PINCODE: Record<CustomerPreferredLanguage, string> = {
   en: "Please share your 6-digit pincode:",
-  mr: "कृपया तुमचा 6-अंकी pincode पाठवा:",
-  hi: "कृपया अपना 6-अंकी pincode भेजें:",
+  mr: "कृपया तुमचा 6-अंकी पिनकोड लिहा:",
+  hi: "कृपया अपना 6-अंकी पिनकोड भेजें:",
 };
 
 export const COLLECT_ADDRESS: Record<CustomerPreferredLanguage, string> = {
-  en: "Please share your full address:",
-  mr: "कृपया तुमचा full address पाठवा:",
-  hi: "कृपया अपना full address भेजें:",
+  en: "Please share your full address for the service visit:",
+  mr: "कृपया सेवेसाठी तुमचा पूर्ण पत्ता लिहा:",
+  hi: "कृपया सेवा के लिए अपना पूरा पता भेजें:",
 };
 
 export const INVALID_PINCODE: Record<CustomerPreferredLanguage, string> = {
   en: "Please enter a valid 6-digit pincode.",
-  mr: "कृपया वैध 6-अंकी pincode प्रविष्ट करा.",
-  hi: "कृपया valid 6-अंकी pincode दर्ज करें।",
+  mr: "कृपया वैध 6-अंकी पिनकोड लिहा.",
+  hi: "कृपया मान्य 6-अंकी पिनकोड दर्ज करें।",
 };
 
 export function dateSelectionPrompt(lang: CustomerPreferredLanguage): string {
-  const today = todayIso();
-  const tomorrow = tomorrowIso();
-  const headers = {
-    en: "When would you like the service?",
-    mr: "तुम्हाला service कधी हवी आहे?",
-    hi: "आपको service कब चाहिए?",
+  const options = bookingDateOptions();
+  const lines = options.map((o) => `${o.index}. ${o.label}`);
+
+  const templates = {
+    mr: `आपल्या सेवेसाठीची तारीख निवडा:\n\n${lines.join("\n")}\n\nकृपया पर्याय क्रमांक निवडा.`,
+    hi: `अपनी सेवा के लिए तारीख चुनें:\n\n${lines.join("\n")}\n\nकृपया विकल्प क्रमांक चुनें।`,
+    en: `Please select the date for your service:\n\n${lines.join("\n")}\n\nPlease reply with the option number.`,
   };
-  const options = {
-    en: [
-      `1. Today (${today})`,
-      `2. Tomorrow (${tomorrow})`,
-      "3. Another date (reply as DD-MM-YYYY)",
-    ],
-    mr: [
-      `1. आज (${today})`,
-      `2. उद्या (${tomorrow})`,
-      "3. दुसरी तारीख (DD-MM-YYYY मध्ये reply करा)",
-    ],
-    hi: [
-      `1. आज (${today})`,
-      `2. कल (${tomorrow})`,
-      "3. दूसरी तारीख (DD-MM-YYYY में reply करें)",
-    ],
-  };
-  return `${headers[lang]}\n\n${options[lang].join("\n")}`;
+
+  return templates[lang];
 }
 
 export const INVALID_DATE: Record<CustomerPreferredLanguage, string> = {
-  en: "Invalid or past date. Please choose today, tomorrow, or a future date (DD-MM-YYYY).",
-  mr: "चुकीची किंवा मागील तारीख. आज, उद्या किंवा भविष्यातील तारीख (DD-MM-YYYY) निवडा.",
-  hi: "गलत या past date। आज, कल या future date (DD-MM-YYYY) चुनें।",
+  en: "That date is not available. Please choose a date within the next 7 days.",
+  mr: "ही तारीख उपलब्ध नाही. कृपया पुढील 7 दिवसांतील तारीख निवडा.",
+  hi: "यह तारीख उपलब्ध नहीं है। कृपया अगले 7 दिनों में से तारीख चुनें।",
 };
 
-export function slotSelectionPrompt(lang: CustomerPreferredLanguage): string {
-  const headers = {
-    en: "Please select a 2-hour time slot:",
-    mr: "कृपया 2-तासाचा time slot निवडा:",
-    hi: "कृपया 2-घंटे का time slot चुनें:",
+export const CUSTOM_DATE_INSTRUCTION: Record<CustomerPreferredLanguage, string> = {
+  en: `Please send the date in DD-MM-YYYY format (for example: ${formatIsoAsDdMmYyyy(bookingDateOptions()[0]?.iso ?? "01-01-2026")}).\nBookings are available for the next 7 days only.`,
+  mr: `कृपया तारीख DD-MM-YYYY या स्वरूपात पाठवा.\nफक्त पुढील 7 दिवसांसाठी booking उपलब्ध आहे.`,
+  hi: `कृपया तारीख DD-MM-YYYY प्रारूप में भेजें।\nबुकिंग केवल अगले 7 दिनों के लिए उपलब्ध है।`,
+};
+
+export function savedAddressConfirmationMessage(
+  lang: CustomerPreferredLanguage,
+  input: { area: string; pincode: string; addressLine: string },
+): string {
+  const templates = {
+    mr: `तुमचा सेवेसाठीचा पत्ता:
+
+📍 परिसर: ${input.area}
+📮 पिनकोड: ${input.pincode}
+🏠 पत्ता: ${input.addressLine}
+
+हा पत्ता वापरायचा आहे का?
+1 — हो, हा पत्ता वापरा
+2 — नाही, नवीन पत्ता द्या`,
+    hi: `आपकी सेवा का पता:
+
+📍 क्षेत्र: ${input.area}
+📮 पिनकोड: ${input.pincode}
+🏠 पता: ${input.addressLine}
+
+इस पते का उपयोग करने के लिए 1 भेजें।
+पता बदलने के लिए 2 भेजें।`,
+    en: `Your address for this service:
+
+📍 Area: ${input.area}
+📮 Pincode: ${input.pincode}
+🏠 Address: ${input.addressLine}
+
+Reply 1 to use this address.
+Reply 2 to enter a new address.`,
   };
-  const lines = TIME_SLOTS.map((s) => `${s.index}. ${s.value}`);
-  return `${headers[lang]}\n\n${lines.join("\n")}`;
+  return templates[lang];
+}
+
+export const INVALID_ADDRESS_CONFIRM_REPLY: Record<CustomerPreferredLanguage, string> = {
+  en: "Please reply with 1 to use this address or 2 to enter a new address.",
+  mr: "या पत्त्यासाठी 1 किंवा नवीन पत्त्यासाठी 2 पाठवा.",
+  hi: "इस पते के लिए 1 या नया पता दर्ज करने के लिए 2 भेजें।",
+};
+
+function pairSlotLines(items: string[]): string {
+  const rows: string[] = [];
+  for (let i = 0; i < items.length; i += 2) {
+    if (i + 1 < items.length) {
+      rows.push(`${items[i]}, ${items[i + 1]}`);
+    } else {
+      rows.push(items[i]!);
+    }
+  }
+  return rows.join("\n");
+}
+
+export function slotSelectionPrompt(lang: CustomerPreferredLanguage): string {
+  const templates = {
+    mr: {
+      header: "कृपया आपला पसंतीचा वेळ निवडा:",
+      items: [
+        "1. 08:00–10:00",
+        "2. 10:00–12:00",
+        "3. 12:00–14:00",
+        "4. 14:00–16:00",
+        "5. 16:00–18:00",
+        "6. 18:00–20:00",
+        "7. 20:00–22:00",
+      ],
+      footer: "कृपया आपल्या पसंतीचा पर्याय निवडा.",
+    },
+    hi: {
+      header: "कृपया अपनी सेवा के लिए सुविधानुसार समय चुनें:",
+      items: [
+        "1. 08:00–10:00",
+        "2. 10:00–12:00",
+        "3. 12:00–14:00",
+        "4. 14:00–16:00",
+        "5. 16:00–18:00",
+        "6. 18:00–20:00",
+        "7. 20:00–22:00",
+      ],
+      footer: "कृपया अपना पसंदीदा विकल्प चुनें।",
+    },
+    en: {
+      header: "Please select your preferred time for the service:",
+      items: [
+        "1. 8:00 AM – 10:00 AM",
+        "2. 10:00 AM – 12:00 PM",
+        "3. 12:00 PM – 02:00 PM",
+        "4. 02:00 PM – 04:00 PM",
+        "5. 04:00 PM – 06:00 PM",
+        "6. 06:00 PM – 08:00 PM",
+        "7. 08:00 PM – 10:00 PM",
+      ],
+      footer: "Please reply with your preferred option.",
+    },
+  };
+
+  const t = templates[lang];
+  return `${t.header}\n\n${pairSlotLines(t.items)}\n\n${t.footer}`;
 }
 
 export const INVALID_SLOT: Record<CustomerPreferredLanguage, string> = {
-  en: "Invalid slot. Reply with a number from 1 to 7.",
-  mr: "चुकीचा slot. 1 ते 7 मधील number पाठवा.",
-  hi: "गलत slot। 1 से 7 में से number भेजें।",
+  en: "Invalid selection. Please reply with a number from 1 to 7.",
+  mr: "चुकीची निवड. कृपया 1 ते 7 मधील क्रमांक निवडा.",
+  hi: "गलत चयन। कृपया 1 से 7 में से सही क्रमांक भेजें।",
 };
 
 export const PRICING_UNAVAILABLE: Record<CustomerPreferredLanguage, string> = {
-  en: "Pricing is currently unavailable for this service. Please contact Homigo support or try again later.\n\nReply *hi* anytime to start a new request.",
-  mr: "या service साठी सध्या pricing उपलब्ध नाही. कृपया Homigo support शी संपर्क साधा किंवा नंतर पुन्हा प्रयत्न करा.\n\nनवीन request साठी *hi* पाठवा.",
-  hi: "इस service के लिए अभी pricing उपलब्ध नहीं है। कृपया Homigo support से संपर्क करें या बाद में पुनः प्रयास करें।\n\nनया request शुरू करने के लिए *hi* भेजें।",
+  en: "Pricing is currently unavailable for this service. Please contact Homigo support or try again later.\n\nSend *hi* anytime to start a new request.",
+  mr: "या सेवेसाठी सध्या दर उपलब्ध नाहीत. कृपया Homigo सपोर्टशी संपर्क साधा किंवा नंतर पुन्हा प्रयत्न करा.\n\nनवीन विनंतीसाठी *hi* पाठवा.",
+  hi: "इस सेवा के लिए अभी दर उपलब्ध नहीं है। कृपया Homigo सपोर्ट से संपर्क करें या बाद में पुनः प्रयास करें।\n\nनई अनुरोध के लिए *hi* भेजें।",
 };
 
 export function rateCardQuoteMessage(
@@ -105,95 +190,87 @@ export function rateCardQuoteMessage(
   serviceName: string,
   serviceDate: string,
   slot: string,
-  amounts: CalculatedBookingAmounts,
+  _amounts: CalculatedBookingAmounts,
 ): string {
   const dateLabel = formatDisplayDate(serviceDate, lang);
-  const base = formatCurrency(amounts.base_amount);
-  const lead = formatCurrency(amounts.lead_charge);
-  const total = formatCurrency(amounts.final_amount);
+  const cash = formatCurrency(HOMIGO_CASH_PAYMENT_AMOUNT);
+  const upi = formatCurrency(HOMIGO_UPI_PAYMENT_AMOUNT);
+  const discount = formatCurrency(HOMIGO_UPI_DISCOUNT);
 
+  const title = homigoRateCardTitle(serviceName);
   const templates = {
-    en: `📋 Service quote for *${serviceName}*
+    en: `📋 *${title}*
 
 📅 Date: ${dateLabel}
-⏰ Slot: ${slot}
+⏰ Time: ${slot}
 
-Base amount: ${base}
-Lead charge: ${lead}
-*Total: ${total}*
+*Pricing:*
+Cash — ${cash}
+UPI — ${upi} (${discount} discount)
 
 Reply:
-1️⃣ Accept
-2️⃣ Reject`,
-    mr: `📋 *${serviceName}* साठी quote
+1 — Accept
+2 — Decline`,
+    mr: `📋 *${title}*
 
 📅 तारीख: ${dateLabel}
-⏰ Slot: ${slot}
+⏰ वेळ: ${slot}
 
-Base amount: ${base}
-Lead charge: ${lead}
-*एकूण: ${total}*
+*दर:*
+Cash — ${cash}
+UPI — ${upi} (₹${HOMIGO_UPI_DISCOUNT} सवलत)
 
-Reply:
-1️⃣ Accept
-2️⃣ Reject`,
-    hi: `📋 *${serviceName}* के लिए quote
+उत्तर द्या:
+1 — मान्य करा
+2 — नकार करा`,
+    hi: `📋 *${title}*
 
-📅 Date: ${dateLabel}
-⏰ Slot: ${slot}
+📅 तारीख: ${dateLabel}
+⏰ समय: ${slot}
 
-Base amount: ${base}
-Lead charge: ${lead}
-*Total: ${total}*
+*दर:*
+Cash — ${cash}
+UPI — ${upi} (₹${HOMIGO_UPI_DISCOUNT} छूट)
 
-Reply:
-1️⃣ Accept
-2️⃣ Reject`,
+उत्तर दें:
+1 — स्वीकार करें
+2 — अस्वीकार करें`,
   };
 
   return templates[lang];
 }
 
 export const RATE_CARD_ACCEPTED: Record<CustomerPreferredLanguage, string> = {
-  en: "Thank you! Your quote has been accepted. We are finding a worker for you — you will hear from us shortly.",
-  mr: "धन्यवाद! तुमचा quote accept झाला आहे. आम्ही worker शोधत आहोत — लवकरच संपर्क करू.",
-  hi: "धन्यवाद! आपका quote accept हो गया है। हम worker ढूंढ रहे हैं — जल्द ही संपर्क करेंगे।",
+  en: "Thank you! Homigo has received your service request. Our technician will contact you shortly.",
+  mr: "धन्यवाद! Homigo ने आपली विनंती नोंदवली आहे. आमचा Technician लवकरच आपल्याशी संपर्क साधेल.",
+  hi: "धन्यवाद! Homigo ने आपकी सेवा अनुरोध दर्ज कर ली है. हमारा Technician जल्द ही आपसे संपर्क करेगा.",
 };
 
 export const RATE_CARD_REJECTED: Record<CustomerPreferredLanguage, string> = {
-  en: "No problem. Your request has been cancelled. Reply *hi* anytime to book a new service.",
-  mr: "काही हरकत नाही. तुमची request cancel झाली. नवीन service booking साठी *hi* पाठवा.",
-  hi: "कोई बात नहीं। आपका request cancel हो गया। नई service book करने के लिए *hi* भेजें।",
+  en: "No problem. Your request has been cancelled. Send *hi* anytime to book a new service.",
+  mr: "काही हरकत नाही. तुमची विनंती रद्द केली आहे. नवीन सेवेसाठी *hi* पाठवा.",
+  hi: "कोई बात नहीं। आपका अनुरोध रद्द कर दिया गया है। नई सेवा के लिए *hi* भेजें।",
 };
 
 export const INVALID_RATE_CARD_REPLY: Record<CustomerPreferredLanguage, string> = {
-  en: "Please reply with 1 to Accept or 2 to Reject.",
-  mr: "Accept साठी 1 किंवा Reject साठी 2 reply करा.",
-  hi: "Accept के लिए 1 या Reject के लिए 2 reply करें।",
+  en: "Please reply with 1 to accept or 2 to decline.",
+  mr: "स्वीकारासाठी 1 किंवा नकारासाठी 2 पाठवा.",
+  hi: "स्वीकार के लिए 1 या अस्वीकार के लिए 2 भेजें।",
 };
 
 export const WORKER_MATCHING_PENDING: Record<CustomerPreferredLanguage, string> = {
-  en: "Your request is being processed. We will notify you when a worker is assigned.",
-  mr: "तुमची request process होत आहे. worker assign झाल्यावर आम्ही कळवू.",
-  hi: "आपका request process हो रहा है। worker assign होने पर हम सूचित करेंगे।",
+  en: RATE_CARD_ACCEPTED.en,
+  mr: RATE_CARD_ACCEPTED.mr,
+  hi: RATE_CARD_ACCEPTED.hi,
 };
 
 export const WORKER_MATCHING_STARTED: Record<
   CustomerPreferredLanguage,
   (offerCount: number) => string
 > = {
-  en: (n) =>
-    n > 0
-      ? `Thank you! Your quote is accepted. We are contacting ${n} nearby worker(s). You will be notified when one accepts.`
-      : "Thank you! Your quote is accepted. We could not find available workers right now — our team will follow up shortly.",
-  mr: (n) =>
-    n > 0
-      ? `धन्यवाद! Quote accept झाला. आम्ही ${n} worker ला contact करत आहोत. कोणी accept केल्यावर कळवू.`
-      : "धन्यवाद! Quote accept झाला. सध्या available worker सापडले नाहीत — team लवकर contact करेल.",
-  hi: (n) =>
-    n > 0
-      ? `धन्यवाद! Quote accept हो गया। हम ${n} workers को contact कर रहे हैं। accept होने पर सूचित करेंगे।`
-      : "धन्यवाद! Quote accept हो गया। अभी available worker नहीं मिला — team जल्द contact करेगी।",
+  en: () => RATE_CARD_ACCEPTED.en,
+  mr: () => RATE_CARD_ACCEPTED.mr,
+  hi: () => RATE_CARD_ACCEPTED.hi,
 };
 
 export function returningCustomerGreetingWithMenu(

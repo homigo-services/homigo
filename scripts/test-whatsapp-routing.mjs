@@ -8,6 +8,7 @@ import {
   customerStateUsesNumericMenu,
   shouldSkipLanguageForReturningCustomer,
 } from "../src/lib/whatsapp/routing.ts";
+import { shouldResetOnboardingGreeting } from "../src/lib/whatsapp/fsm-guards.ts";
 import { parseLanguageSelection } from "../src/lib/whatsapp/messages.ts";
 
 const tests = [];
@@ -78,6 +79,16 @@ function run() {
     "completed greeting reset only applies to completed state",
     !["worker_assignment", "rate_card_confirmation"].includes("completed"),
     "worker_assignment no longer resets on hi",
+  );
+
+  log(
+    "date_selection + hi uses greeting reset guard",
+    shouldResetOnboardingGreeting("date_selection"),
+  );
+
+  log(
+    "worker_assignment excluded from greeting reset guard",
+    !shouldResetOnboardingGreeting("worker_assignment"),
   );
 
   console.log(`\n${passCount}/${tests.length} routing tests passed`);

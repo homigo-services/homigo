@@ -434,6 +434,60 @@ async function run() {
     await cleanupTestMobile(mobile);
   }
 
+  // 11d. stale date_selection + hi → language onboarding (NOT date prompt / INVALID_DATE)
+  {
+    const mobile = "919999888833";
+    await cleanupTestMobile(mobile);
+
+    const sb = supabaseClient();
+    const { data: customer } = await sb
+      .from("customers")
+      .insert({
+        name: mobile,
+        mobile,
+        area: "pending",
+        pincode: "pending",
+        address_line: "pending",
+        preferred_language: "mr",
+        is_whatsapp_verified: true,
+        source: "whatsapp",
+        status: "active",
+        subscription_status: "free",
+      })
+      .select("*")
+      .single();
+
+    await sb.from("whatsapp_conversations").insert({
+      whatsapp_mobile: mobile,
+      customer_id: customer.id,
+      preferred_language: "mr",
+      state: "date_selection",
+      context: {
+        phase: "date_selection",
+        service_id: "00000000-0000-0000-0000-000000000099",
+        service_name: "Plumber",
+      },
+    });
+
+    const { res } = await request("/api/whatsapp/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildPayload(`wamid.test.stale.date.${Date.now()}`, mobile, "hi")),
+    });
+
+    const conv = await getConversation(mobile);
+    log(
+      "stale date_selection + hi → language_selection welcome",
+      res.ok &&
+        conv?.state === "language_selection" &&
+        conv?.context?.whatsapp_onboarding_started === true &&
+        !conv?.context?.service_id,
+      `state=${conv?.state} service_id=${conv?.context?.service_id ?? "cleared"}`,
+    );
+
+    await cleanupTestMobile(mobile);
+  }
+
   // 11c. language_selection + phase=ready + fresh onboarding + '1' → service_selection (language parsed)
   {
     const mobile = "919999888855";
@@ -541,7 +595,7 @@ async function run() {
     await cleanupTestMobile(mobile);
   }
 
-  // 12. Existing customer with ready service_selection skips language menu
+  // 12. service_selection + hi → greeting reset to language onboarding
   {
     const mobile = "919999888899";
     await cleanupTestMobile(mobile);
@@ -569,7 +623,7 @@ async function run() {
       customer_id: customer.id,
       preferred_language: "en",
       state: "service_selection",
-      context: { phase: "ready" },
+      context: { phase: "ready", service_id: "00000000-0000-0000-0000-000000000099" },
     });
 
     const msgId = `wamid.test.returning.${Date.now()}`;
@@ -581,12 +635,13 @@ async function run() {
 
     const conv = await getConversation(mobile);
     log(
-      "Existing customer skip language menu",
+      "service_selection + hi → language_selection greeting reset",
       res.ok &&
-        conv?.state === "service_selection" &&
-        conv?.context?.phase === "ready" &&
+        conv?.state === "language_selection" &&
+        conv?.context?.whatsapp_onboarding_started === true &&
+        !conv?.context?.service_id &&
         customer?.preferred_language === "en",
-      `state=${conv?.state}`,
+      `state=${conv?.state} service_id=${conv?.context?.service_id ?? "cleared"}`,
     );
 
     await cleanupTestMobile(mobile);

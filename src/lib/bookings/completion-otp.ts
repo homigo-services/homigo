@@ -15,7 +15,8 @@ export type RequestCompletionOtpError =
 
 export type VerifyCompletionOtpError =
   | "booking_not_found"
-  | "customer_mismatch"
+  | "worker_mismatch"
+  | "worker_not_assigned"
   | "no_otp_pending"
   | "already_verified"
   | "expired"
@@ -176,12 +177,12 @@ export interface VerifyCompletionOtpResult {
 
 export async function verifyCompletionOtp(
   supabase: SupabaseClient,
-  input: { bookingId: string; customerId: string; rawOtp: string },
+  input: { bookingId: string; workerId: string; rawOtp: string },
 ): Promise<VerifyCompletionOtpResult> {
   const { data: booking, error } = await supabase
     .from("booking")
     .select(
-      "id, customer_id, completion_otp_hash, otp_expires_at, otp_attempts, otp_verified",
+      "id, worker_id, customer_id, completion_otp_hash, otp_expires_at, otp_attempts, otp_verified",
     )
     .eq("id", input.bookingId)
     .maybeSingle();
@@ -190,8 +191,12 @@ export async function verifyCompletionOtp(
     return { ok: false, error: "booking_not_found" };
   }
 
-  if (String(booking.customer_id) !== String(input.customerId)) {
-    return { ok: false, error: "customer_mismatch" };
+  if (!booking.worker_id) {
+    return { ok: false, error: "worker_not_assigned" };
+  }
+
+  if (String(booking.worker_id) !== String(input.workerId)) {
+    return { ok: false, error: "worker_mismatch" };
   }
 
   if (booking.otp_verified) {
@@ -243,6 +248,7 @@ export async function verifyCompletionOtp(
       updated_at: now,
     })
     .eq("id", input.bookingId)
+    .eq("worker_id", input.workerId)
     .eq("otp_verified", false);
 
   if (verifyError) {
@@ -250,4 +256,36 @@ export async function verifyCompletionOtp(
   }
 
   return { ok: true, alreadyVerified: false };
+}
+
+/** Booking with a pending completion OTP for this worker (for WhatsApp/App routing). */
+export async function getBookingPendingWorkerOtpVerification(
+  supabase: SupabaseClient,
+  workerId: string,
+): Promise<{ bookingId: string; customerId: string } | null> {
+  const { data: booking } = await supabase
+    .from("booking")
+    .select(
+      "id, customer_id, completion_otp_hash, otp_expires_at, otp_verified, otp_attempts, booking_status",
+    )
+    .eq("worker_id", workerId)
+    .eq("otp_verified", false)
+    .in("booking_status", ["assigned", "in_progress"])
+    .not("completion_otp_hash", "is", null)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!booking?.completion_otp_hash) return null;
+  if (isOtpExpired(booking.otp_expires_at ? String(booking.otp_expires_at) : null)) {
+    return null;
+  }
+  if (Number(booking.otp_attempts ?? 0) >= COMPLETION_OTP_MAX_ATTEMPTS) {
+    return null;
+  }
+
+  return {
+    bookingId: String(booking.id),
+    customerId: String(booking.customer_id),
+  };
 }
